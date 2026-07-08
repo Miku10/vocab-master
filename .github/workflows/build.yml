@@ -24,6 +24,10 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Add Rust cargo bin to PATH
+        run: echo "$HOME\.cargo\bin" >> $GITHUB_PATH
+        shell: bash
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -36,8 +40,11 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2"
 
+      - name: Verify Tauri CLI
+        run: tauri --version
+
       - name: Build NSIS installer
-        run: cargo tauri build --bundles nsis
+        run: tauri build --bundles nsis
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
