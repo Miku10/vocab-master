@@ -17,6 +17,9 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Install root deps (Tauri CLI)
+        run: npm ci
+
       - name: Install frontend deps
         run: npm ci
         working-directory: frontend
@@ -33,9 +36,6 @@ jobs:
             src-tauri/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2"
-
       - name: Build NSIS installer
         run: npx tauri build --bundles nsis
 
@@ -48,7 +48,6 @@ jobs:
 
       - name: Cleanup build environment
         run: |
-          cargo uninstall tauri-cli
           Remove-Item -Recurse -Force "$env:USERPROFILE\.cargo\registry" -ErrorAction SilentlyContinue
           Remove-Item -Recurse -Force "$env:USERPROFILE\.cargo\git" -ErrorAction SilentlyContinue
           Remove-Item -Recurse -Force "src-tauri\target" -ErrorAction SilentlyContinue
