@@ -17,9 +17,6 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install root deps (Tauri CLI)
-        run: npm ci
-
       - name: Install frontend deps
         run: npm ci
         working-directory: frontend
@@ -36,8 +33,11 @@ jobs:
             src-tauri/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2"
+
       - name: Build NSIS installer
-        run: npx tauri build --bundles nsis
+        run: cargo tauri build --bundles nsis
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
