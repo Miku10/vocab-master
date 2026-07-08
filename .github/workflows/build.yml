@@ -38,8 +38,7 @@ jobs:
 
       - name: Build NSIS installer
         run: |
-          $env:PATH += ";$env:USERPROFILE\.cargo\bin"
-          tauri build --bundles nsis
+          cargo tauri build --bundles nsis
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
