@@ -33,12 +33,9 @@ jobs:
             src-tauri/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2"
-
       - name: Build NSIS installer
-        run: |
-          cargo tauri build --bundles nsis
+        run: npm run tauri:build
+        working-directory: frontend
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
