@@ -1,14 +1,14 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use tauri::Manager;
 
 // ==================== 数据模型 ====================
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Word {
     pub id: i32,
     pub word: String,
@@ -87,6 +87,12 @@ pub struct WrongWord {
     pub count: i32,
 }
 
+#[derive(Debug, Serialize)]
+pub struct StudyQueueItem {
+    pub word: Word,
+    pub kind: String,
+}
+
 // ==================== 配置管理 ====================
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -110,6 +116,16 @@ pub struct AppConfig {
     pub model: ModelConfig,
     pub search: SearchConfig,
     pub audio_expire_hours: u64,
+    #[serde(default = "default_daily_new_words")]
+    pub daily_new_words: u32,
+    #[serde(default = "default_daily_review_words")]
+    pub daily_review_words: u32,
+    #[serde(default = "default_active_level")]
+    pub active_level: String,
+    #[serde(default)]
+    pub setup_complete: bool,
+    #[serde(default)]
+    pub prompts: HashMap<String, String>,
 }
 
 impl Default for AppConfig {
@@ -128,8 +144,25 @@ impl Default for AppConfig {
                 timeout_seconds: 15,
             },
             audio_expire_hours: 5,
+            daily_new_words: default_daily_new_words(),
+            daily_review_words: default_daily_review_words(),
+            active_level: default_active_level(),
+            setup_complete: false,
+            prompts: HashMap::new(),
         }
     }
+}
+
+fn default_active_level() -> String {
+    "junior".into()
+}
+
+fn default_daily_new_words() -> u32 {
+    20
+}
+
+fn default_daily_review_words() -> u32 {
+    30
 }
 
 // ==================== 类型别名 ====================
@@ -206,21 +239,132 @@ fn get_db(app: &tauri::AppHandle) -> Result<DbPool, String> {
 
 // ==================== Tauri 命令 ====================
 
-/// 获取词库目录路径
-#[tauri::command]
-fn get_words_dir() -> String {
+const PRESET_WORD_BANKS: &[(&str, &str)] = &[
+    ("junior", include_str!("../../data/words/junior.json")),
+    ("high", include_str!("../../data/words/high.json")),
+    ("cet4", include_str!("../../data/words/cet4.json")),
+    ("cet6", include_str!("../../data/words/cet6.json")),
+];
+
+fn words_dir_path() -> PathBuf {
     let mut path = dirs::data_dir().expect("无法获取数据目录");
     path.push("vocab-master");
     path.push("words");
+    path
+}
+
+fn validate_level(level: &str) -> Result<(), String> {
+    if level
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        Ok(())
+    } else {
+        Err("学段名称只能包含字母、数字、下划线或连字符".into())
+    }
+}
+
+fn word_bank_path(level: &str) -> Result<PathBuf, String> {
+    validate_level(level)?;
+    let mut path = words_dir_path();
+    path.push(format!("{}.json", level));
+    Ok(path)
+}
+
+fn preset_words_content(level: &str) -> Option<&'static str> {
+    PRESET_WORD_BANKS
+        .iter()
+        .find(|(key, _)| *key == level)
+        .map(|(_, content)| *content)
+}
+
+fn word_from_value(value: Value, index: usize, fallback_level: &str) -> Result<Word, String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| format!("第 {} 条词库数据不是对象", index + 1))?;
+    let word = obj
+        .get("word")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| format!("第 {} 条词库数据缺少 word 字段", index + 1))?;
+
+    let definition = match obj.get("definition") {
+        Some(Value::String(v)) => v.clone(),
+        Some(v) => serde_json::to_string(v).map_err(|e| e.to_string())?,
+        None => obj
+            .get("meaning")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    };
+
+    Ok(Word {
+        id: obj
+            .get("id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or((index + 1) as i64) as i32,
+        word: word.to_string(),
+        phonetic_en: obj
+            .get("phonetic_en")
+            .or_else(|| obj.get("phonetic"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        phonetic_us: obj
+            .get("phonetic_us")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        definition,
+        example: obj
+            .get("example")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        level: obj
+            .get("level")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or(fallback_level)
+            .to_string(),
+        frequency: obj
+            .get("frequency")
+            .and_then(|v| v.as_i64())
+            .unwrap_or((index + 1) as i64) as i32,
+    })
+}
+
+fn parse_word_bank(level: &str, content: &str) -> Result<Vec<Word>, String> {
+    let raw_words: Vec<Value> = serde_json::from_str(content).map_err(|e| e.to_string())?;
+    raw_words
+        .into_iter()
+        .enumerate()
+        .map(|(idx, value)| word_from_value(value, idx, level))
+        .collect()
+}
+
+fn save_word_bank(level: &str, content: &str) -> Result<usize, String> {
+    let words = parse_word_bank(level, content)?;
+    fs::create_dir_all(words_dir_path()).map_err(|e| e.to_string())?;
+    let path = word_bank_path(level)?;
+    let json = serde_json::to_string_pretty(&words).map_err(|e| e.to_string())?;
+    fs::write(path, json).map_err(|e| e.to_string())?;
+    Ok(words.len())
+}
+
+/// 获取词库目录路径
+#[tauri::command]
+fn get_words_dir() -> String {
+    let path = words_dir_path();
     path.to_string_lossy().to_string()
 }
 
 /// 确保词库目录存在
 #[tauri::command]
 fn ensure_words_dir() -> Result<String, String> {
-    let mut path = dirs::data_dir().expect("无法获取数据目录");
-    path.push("vocab-master");
-    path.push("words");
+    let path = words_dir_path();
     fs::create_dir_all(&path).map_err(|e| e.to_string())?;
     Ok(path.to_string_lossy().to_string())
 }
@@ -228,18 +372,92 @@ fn ensure_words_dir() -> Result<String, String> {
 /// 加载指定学段的词库
 #[tauri::command]
 fn load_words(level: String) -> Result<Vec<Word>, String> {
-    let mut path = dirs::data_dir().expect("无法获取数据目录");
-    path.push("vocab-master");
-    path.push("words");
-    path.push(format!("{}.json", level));
+    let path = word_bank_path(&level)?;
 
     if !path.exists() {
-        return Ok(Vec::new());
+        if let Some(content) = preset_words_content(&level) {
+            save_word_bank(&level, content)?;
+        } else {
+            return Ok(Vec::new());
+        }
     }
 
     let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let words: Vec<Word> = serde_json::from_str(&content).map_err(|e| e.to_string())?;
-    Ok(words)
+    parse_word_bank(&level, &content)
+}
+
+/// 导入或覆盖指定学段的词库
+#[tauri::command]
+fn import_words(level: String, content: String) -> Result<usize, String> {
+    save_word_bank(&level, &content)
+}
+
+/// 获取今日学习队列：到期复习词 + 新词
+#[tauri::command]
+fn get_study_queue(
+    app: tauri::AppHandle,
+    level: String,
+    new_count: u32,
+    review_count: u32,
+) -> Result<Vec<StudyQueueItem>, String> {
+    let words = load_words(level.clone())?;
+    let word_map: HashMap<i32, Word> = words.iter().cloned().map(|word| (word.id, word)).collect();
+    let pool = get_db(&app)?;
+    let conn = pool.get().map_err(|e| e.to_string())?;
+
+    let mut queue = Vec::new();
+    let mut used_ids = HashSet::new();
+
+    if review_count > 0 {
+        let mut stmt = conn
+            .prepare(
+                "SELECT word_id FROM word_progress
+                 WHERE level = ?1
+                   AND status != 'new'
+                   AND (next_review IS NULL OR next_review <= datetime('now') OR status = 'hard')
+                 ORDER BY wrong_count DESC, next_review ASC, last_seen ASC
+                 LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let review_ids: Vec<i32> = stmt
+            .query_map(params![level.as_str(), review_count as i64], |row| {
+                row.get(0)
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|row| row.ok())
+            .collect();
+
+        for id in review_ids {
+            if let Some(word) = word_map.get(&id) {
+                used_ids.insert(id);
+                queue.push(StudyQueueItem {
+                    word: word.clone(),
+                    kind: "review".into(),
+                });
+            }
+        }
+    }
+
+    let learned_ids: HashSet<i32> = conn
+        .prepare("SELECT word_id FROM word_progress WHERE level = ?1")
+        .map_err(|e| e.to_string())?
+        .query_map(params![level.as_str()], |row| row.get(0))
+        .map_err(|e| e.to_string())?
+        .filter_map(|row| row.ok())
+        .collect();
+
+    for word in words
+        .into_iter()
+        .filter(|word| !learned_ids.contains(&word.id) && !used_ids.contains(&word.id))
+        .take(new_count as usize)
+    {
+        queue.push(StudyQueueItem {
+            word,
+            kind: "new".into(),
+        });
+    }
+
+    Ok(queue)
 }
 
 /// 播放单词发音（Free Dictionary API）
@@ -296,14 +514,26 @@ async fn play_word_audio(word: String) -> Result<String, String> {
 
 /// 标记单词为已掌握
 #[tauri::command]
-fn mark_word_learned(app: tauri::AppHandle, word_id: i32) -> Result<(), String> {
+fn mark_word_learned(app: tauri::AppHandle, word: Word) -> Result<(), String> {
     let pool = get_db(&app)?;
-    let mut conn = pool.get().map_err(|e| e.to_string())?;
+    let conn = pool.get().map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().to_rfc3339();
+    let word_id = word.id;
+    let word_text = word.word;
+    let level = word.level;
     conn.execute(
-        "INSERT OR REPLACE INTO word_progress (word_id, status, last_seen, review_count, correct_count, next_review)
-         VALUES (?, 'mastered', ?, 1, 1, datetime('now', '+30 days'))",
-        params![word_id, now],
+        "INSERT INTO word_progress
+            (word_id, word, level, status, last_seen, review_count, correct_count, wrong_count, next_review)
+         VALUES (?1, ?2, ?3, 'mastered', ?4, 1, 1, 0, datetime('now', '+30 days'))
+         ON CONFLICT(word_id) DO UPDATE SET
+            word = excluded.word,
+            level = excluded.level,
+            status = 'mastered',
+            last_seen = excluded.last_seen,
+            review_count = word_progress.review_count + 1,
+            correct_count = word_progress.correct_count + 1,
+            next_review = datetime('now', '+30 days')",
+        params![word_id, word_text, level, now],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -311,14 +541,26 @@ fn mark_word_learned(app: tauri::AppHandle, word_id: i32) -> Result<(), String> 
 
 /// 标记单词为困难
 #[tauri::command]
-fn mark_word_hard(app: tauri::AppHandle, word_id: i32) -> Result<(), String> {
+fn mark_word_hard(app: tauri::AppHandle, word: Word) -> Result<(), String> {
     let pool = get_db(&app)?;
-    let mut conn = pool.get().map_err(|e| e.to_string())?;
+    let conn = pool.get().map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().to_rfc3339();
+    let word_id = word.id;
+    let word_text = word.word;
+    let level = word.level;
     conn.execute(
-        "INSERT OR REPLACE INTO word_progress (word_id, status, last_seen, review_count, wrong_count, next_review)
-         VALUES (?, 'hard', ?, 1, 1, datetime('now', '+1 day'))",
-        params![word_id, now],
+        "INSERT INTO word_progress
+            (word_id, word, level, status, last_seen, review_count, correct_count, wrong_count, next_review)
+         VALUES (?1, ?2, ?3, 'hard', ?4, 1, 0, 1, datetime('now', '+1 day'))
+         ON CONFLICT(word_id) DO UPDATE SET
+            word = excluded.word,
+            level = excluded.level,
+            status = 'hard',
+            last_seen = excluded.last_seen,
+            review_count = word_progress.review_count + 1,
+            wrong_count = word_progress.wrong_count + 1,
+            next_review = datetime('now', '+1 day')",
+        params![word_id, word_text, level, now],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -1032,6 +1274,8 @@ pub fn run() {
             get_words_dir,
             ensure_words_dir,
             load_words,
+            import_words,
+            get_study_queue,
             play_word_audio,
             mark_word_learned,
             mark_word_hard,

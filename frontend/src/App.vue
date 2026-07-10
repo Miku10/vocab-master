@@ -30,7 +30,7 @@
 
       <!-- 底部 -->
       <div class="p-4 border-t border-slate-100">
-        <button @click="showSettings = true"
+        <button @click="openSettings"
                 class="flex items-center gap-3 px-4 py-3 rounded-xl w-full
                        text-sm font-medium text-slate-600 hover:bg-slate-100 transition-all">
           <span class="text-lg">⚙️</span>
@@ -45,17 +45,19 @@
     </main>
 
     <!-- 设置弹窗 -->
-    <Settings v-if="showSettings" @close="showSettings = false" />
+    <Settings v-if="showSettings" :initial-setup="needsSetup" @close="closeSettings" />
   </div>
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
+import { invoke } from '@tauri-apps/api/core'
 import Settings from './components/Settings.vue'
 
 const route = useRoute()
 const showSettings = ref(false)
+const needsSetup = ref(false)
 
 const menuItems = [
   { path: '/', icon: '📊', label: '学习仪表盘' },
@@ -67,4 +69,26 @@ const menuItems = [
 function isActive(path) {
   return route.path === path
 }
+
+function openSettings() {
+  needsSetup.value = false
+  showSettings.value = true
+}
+
+function closeSettings() {
+  needsSetup.value = false
+  showSettings.value = false
+}
+
+onMounted(async () => {
+  try {
+    const config = await invoke('get_config')
+    if (!config.setup_complete) {
+      needsSetup.value = true
+      showSettings.value = true
+    }
+  } catch (e) {
+    console.warn('读取配置失败:', e)
+  }
+})
 </script>

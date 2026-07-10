@@ -16,17 +16,11 @@
       </div>
     </div>
 
-    <div class="grid grid-cols-2 gap-6">
+    <div class="grid grid-cols-1 gap-6">
       <!-- 学习进度环形图 -->
       <div class="bg-white rounded-2xl p-6 shadow-sm border border-slate-100">
         <h3 class="text-lg font-semibold text-slate-800 mb-4">📊 学习进度</h3>
         <div ref="progressChart" style="height: 280px;"></div>
-      </div>
-
-      <!-- 各学段掌握度 -->
-      <div class="bg-white rounded-2xl p-6 shadow-sm border border-slate-100">
-        <h3 class="text-lg font-semibold text-slate-800 mb-4">📚 各学段掌握度</h3>
-        <div ref="levelChart" style="height: 280px;"></div>
       </div>
     </div>
 
@@ -50,7 +44,6 @@ import { invoke } from '@tauri-apps/api/core'
 import * as echarts from 'echarts'
 
 const progressChart = ref(null)
-const levelChart = ref(null)
 const trendChart = ref(null)
 const wrongChart = ref(null)
 
@@ -84,23 +77,7 @@ function initCharts() {
     }]
   })
 
-  // 2. 柱状图
-  const c2 = echarts.init(levelChart.value)
-  const levelNames = ['小学', '初中', '高中', '四级', '六级']
-  const levelColors = ['#a78bfa', '#60a5fa', '#34d399', '#fbbf24', '#f87171']
-  c2.setOption({
-    tooltip: { trigger: 'axis', backgroundColor: '#1e293b', textStyle: { color: '#fff' } },
-    grid: { left: '3%', right: '4%', bottom: '3%', containLabel: true },
-    xAxis: { type: 'category', data: levelNames, axisLabel: { color: '#64748b', fontSize: 13 } },
-    yAxis: { type: 'value', max: 100, axisLabel: { color: '#94a3b8', formatter: '{value}%' } },
-    series: [{
-      type: 'bar', barWidth: 32,
-      data: levelNames.map((_, i) => ({ value: 0, itemStyle: { color: levelColors[i], borderRadius: [6, 6, 0, 0] } })),
-      label: { show: true, position: 'top', formatter: '{c}%', color: '#475569' }
-    }]
-  })
-
-  // 3. 折线图
+  // 2. 折线图
   const c3 = echarts.init(trendChart.value)
   c3.setOption({
     tooltip: { trigger: 'axis', backgroundColor: '#1e293b', textStyle: { color: '#fff' } },
@@ -118,7 +95,7 @@ function initCharts() {
     }]
   })
 
-  // 4. 错词图
+  // 3. 错词图
   const c4 = echarts.init(wrongChart.value)
   c4.setOption({
     tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
@@ -135,7 +112,7 @@ function initCharts() {
     }]
   })
 
-  window.addEventListener('resize', () => { c1.resize(); c2.resize(); c3.resize(); c4.resize() })
+  window.addEventListener('resize', () => { c1.resize(); c3.resize(); c4.resize() })
 }
 
 async function loadData() {
@@ -157,16 +134,6 @@ async function loadData() {
           { value: learned - Math.round(learned * rate / 100), name: '学习中', itemStyle: { color: '#3b82f6' } },
           { value: Math.max(0, 100 - learned), name: '未学习', itemStyle: { color: '#e2e8f0' } },
         ]}]
-      })
-    }
-
-    // Update level chart
-    const c2 = echarts.getInstanceByDom(levelChart.value)
-    if (c2 && data.level_mastery.length > 0) {
-      c2.setOption({
-        series: [{ data: data.level_mastery.map(l => ({
-          value: l.value, itemStyle: { color: l.color, borderRadius: [6, 6, 0, 0] }
-        }))}]
       })
     }
 
