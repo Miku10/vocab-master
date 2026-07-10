@@ -141,8 +141,9 @@
 </template>
 
 <script setup>
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
+import { computed, onActivated, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { onBeforeRouteLeave } from 'vue-router'
+import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 
 const levelOptions = [
   { key: 'junior', label: '初中' },
@@ -171,6 +172,7 @@ const audioLoading = ref(false)
 const audioError = ref('')
 let advanceTimer = null
 let sessionStartedAt = 0
+let hasMounted = false
 
 const sessionStats = reactive({
   newWords: 0,
@@ -226,7 +228,27 @@ const parsedDefinitions = computed(() => {
   return [{ pos: '', meaning: definition || '暂无释义' }]
 })
 
-onMounted(loadStudyQueue)
+onMounted(() => {
+  hasMounted = true
+  loadStudyQueue()
+})
+
+onActivated(() => {
+  if (hasMounted && !loading.value && (sessionComplete.value || queueItems.value.length === 0)) {
+    loadStudyQueue()
+  }
+})
+
+onBeforeRouteLeave(() => {
+  clearAdvanceTimer()
+  sessionComplete.value = false
+  showDetail.value = false
+  nextPlan.value = ''
+  queueItems.value = []
+  currentIndex.value = 0
+  resetStats()
+  resetAudioState()
+})
 
 onBeforeUnmount(() => {
   clearAdvanceTimer()
@@ -441,7 +463,7 @@ async function fetchPronunciation() {
   try {
     const url = await invoke('play_word_audio', { word: requestedWord })
     if (currentWord.value.word === requestedWord) {
-      audioUrl.value = url
+      audioUrl.value = normalizeAudioSource(url)
     }
   } catch (e) {
     if (currentWord.value.word === requestedWord) {
@@ -472,5 +494,13 @@ function resetAudioState() {
   audioUrl.value = ''
   audioLoading.value = false
   audioError.value = ''
+}
+
+function normalizeAudioSource(source) {
+  const value = String(source || '')
+  if (/^(https?:|asset:|data:|blob:)/i.test(value)) {
+    return value
+  }
+  return convertFileSrc(value)
 }
 </script>

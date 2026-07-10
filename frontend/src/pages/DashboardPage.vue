@@ -1,5 +1,8 @@
 <template>
   <div class="space-y-6 p-2">
+    <div v-if="loading" class="rounded-2xl bg-white py-12 text-center text-slate-500 shadow-sm ring-1 ring-slate-100">
+      正在加载仪表盘...
+    </div>
     <!-- 统计卡片 -->
     <div class="grid grid-cols-2 gap-4 lg:grid-cols-6">
       <div v-for="stat in stats" :key="stat.label"
@@ -46,6 +49,7 @@ import * as echarts from 'echarts'
 const progressChart = ref(null)
 const trendChart = ref(null)
 const wrongChart = ref(null)
+const loading = ref(true)
 
 const stats = reactive([
   { label: '词库总量', value: '0', icon: '📚', iconBg: 'bg-slate-50' },
@@ -118,6 +122,7 @@ function initCharts() {
 }
 
 async function loadData() {
+  loading.value = true
   try {
     const data = await invoke('get_dashboard_data')
     stats[0].value = data.total_words
@@ -160,5 +165,6 @@ async function loadData() {
   } catch (e) {
     console.error('加载仪表盘数据失败:', e)
   }
+  loading.value = false
 }
 </script>

@@ -3,7 +3,7 @@
     <div class="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
       <div>
         <p class="text-sm font-medium text-blue-600">{{ levelName }} · 模拟测试</p>
-        <h2 class="text-2xl font-bold text-slate-900">中国考试题型训练</h2>
+        <h2 class="text-2xl font-bold text-slate-900">考试题型训练</h2>
       </div>
       <div class="grid gap-2 sm:grid-cols-2">
         <select v-model="selectedExamType" class="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700">
@@ -30,7 +30,7 @@
 
     <div v-else-if="!started" class="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-100 sm:p-8">
       <div class="mb-6">
-        <p class="text-sm font-medium text-slate-500">优先用 AI 按中国考试高频题型生成；未配置模型时使用本地释义默写兜底。</p>
+        <p class="text-sm font-medium text-slate-500">优先用 AI 按考试高频题型生成；未配置模型时使用本地释义默写兜底。</p>
         <h3 class="mt-1 text-2xl font-bold text-slate-900">准备开始 {{ Math.min(quizSize, words.length) }} 题测试</h3>
       </div>
       <button class="rounded-xl bg-blue-600 px-5 py-3 text-sm font-semibold text-white hover:bg-blue-700" @click="startQuiz">
@@ -40,7 +40,7 @@
 
     <div v-else-if="generating" class="rounded-2xl bg-white py-20 text-center text-slate-500 shadow-sm ring-1 ring-slate-100">
       <div class="mb-3 inline-block animate-spin text-3xl">⟳</div>
-      <p>AI 正在生成中国考试题型...</p>
+      <p>AI 正在生成考试题型...</p>
     </div>
 
     <div v-else-if="grading" class="rounded-2xl bg-white py-20 text-center text-slate-500 shadow-sm ring-1 ring-slate-100">
@@ -210,6 +210,7 @@ async function submitQuiz() {
   try {
     if (!config.value?.model?.api_key) {
       result.value = fallback
+      await saveQuizRecord(fallback)
       return
     }
 
@@ -255,9 +256,11 @@ async function submitQuiz() {
 
     const parsed = extractJson(content)
     result.value = normalizeAiResult(parsed, fallback)
+    await saveQuizRecord(result.value)
   } catch (e) {
     console.warn('AI 批阅失败，使用本地评分:', e)
     result.value = fallback
+    await saveQuizRecord(fallback)
   } finally {
     grading.value = false
   }
@@ -265,15 +268,12 @@ async function submitQuiz() {
 
 function buildLocalResult() {
   const items = questions.value.map((question, index) => {
-    const answer = answers.value[index] || ''
-    const isCorrect = question.correctAnswer
-      ? answerMatches(answer, question.correctAnswer)
-      : answerMatches(answer, question.reference)
+    const { answer, isCorrect } = gradeQuestion(question, index)
     return {
       word: question.word.word,
       answer,
       is_correct: isCorrect,
-      score: isCorrect ? 10 : 0,
+      score: questionScore(isCorrect),
       analysis: isCorrect
         ? `答案命中了参考答案：${question.correctAnswer || question.reference}`
         : `参考答案：${question.correctAnswer || question.reference}。${question.explanation || ''}`,
@@ -295,6 +295,7 @@ function buildLocalResult() {
 
 async function generateAiQuestions(seedWords) {
   const selectedType = examTypes.find(type => type.key === selectedExamType.value)?.label || '综合题型'
+  const searchContext = await collectSearchContext(seedWords, selectedType)
   const content = await invoke('call_model_api', {
     config: config.value,
     messages: [
@@ -306,8 +307,12 @@ async function generateAiQuestions(seedWords) {
         role: 'user',
         content: JSON.stringify({
           instruction: '请基于给定词表生成中国考试常见题型。题目要像中考、高考、四六级常见命题：重视语境、固定搭配、词义辨析、完形填空、阅读词义推断。每题必须有题干、选项、正确答案、解析。',
+          search_instruction: searchContext.length
+            ? '已提供联网搜索摘要，请优先结合搜索摘要中的真实搭配、例句、考试语境；但不要编造来源链接。'
+            : '联网搜索未启用、失败或没有结果，请直接基于本地词库和参考释义生成完整题目。',
           exam_type: selectedType,
           count: Math.min(quizSize.value, seedWords.length),
+          search_context: searchContext,
           schema: {
             questions: [
               {
@@ -342,6 +347,27 @@ async function generateAiQuestions(seedWords) {
   return normalized.length ? normalized : buildLocalQuestions(seedWords)
 }
 
+async function collectSearchContext(seedWords, selectedType) {
+  if (!config.value?.search?.enabled) return []
+  const wordsText = seedWords.map(word => word.word).join(' ')
+  try {
+    const results = await invoke('web_search', {
+      config: config.value,
+      query: `${selectedType} 英语考试 词汇 搭配 例句 ${wordsText}`,
+    })
+    return Array.isArray(results)
+      ? results.slice(0, config.value.search.search_count || 5).map(item => ({
+        title: item.title,
+        snippet: item.snippet,
+        url: item.url,
+      }))
+      : []
+  } catch (e) {
+    console.warn('联网搜索失败，继续使用 AI 本地生成:', e)
+    return []
+  }
+}
+
 function normalizeGeneratedQuestion(item, fallbackWord) {
   const wordText = String(item?.word || fallbackWord.word)
   const word = words.value.find(candidate => candidate.word.toLowerCase() === wordText.toLowerCase()) || fallbackWord
@@ -374,16 +400,21 @@ function buildLocalQuestions(seedWords) {
 
 function normalizeAiResult(parsed, fallback) {
   if (!parsed || typeof parsed !== 'object') return fallback
-  const items = Array.isArray(parsed.items) && parsed.items.length
-    ? parsed.items.map((item, index) => ({
-      word: String(item.word || questions.value[index]?.word.word || ''),
-      answer: String(item.answer ?? answers.value[index] ?? ''),
-      is_correct: Boolean(item.is_correct),
-      score: Number(item.score ?? 0),
-      analysis: String(item.analysis || fallback.items[index]?.analysis || ''),
-      suggestion: String(item.suggestion || fallback.items[index]?.suggestion || ''),
-    }))
-    : fallback.items
+  const aiItems = Array.isArray(parsed.items) ? parsed.items : []
+  const items = questions.value.map((question, index) => {
+    const aiItem = aiItems[index] || {}
+    const { answer, isCorrect } = gradeQuestion(question, index)
+    return {
+      word: String(aiItem.word || question.word.word || ''),
+      answer,
+      is_correct: isCorrect,
+      score: questionScore(isCorrect),
+      analysis: String(aiItem.analysis || fallback.items[index]?.analysis || ''),
+      suggestion: String(aiItem.suggestion || fallback.items[index]?.suggestion || ''),
+    }
+  })
+  const correctCount = items.filter(item => item.is_correct).length
+  const score = questions.value.length ? Math.round((correctCount / questions.value.length) * 100) : 0
   const advice = Array.isArray(parsed.advice)
     ? parsed.advice.map(String)
     : parsed.advice
@@ -391,10 +422,59 @@ function normalizeAiResult(parsed, fallback) {
       : fallback.advice
 
   return {
-    score: Math.max(0, Math.min(100, Number(parsed.score ?? fallback.score))),
-    summary: String(parsed.summary || fallback.summary),
+    score,
+    summary: `按参考答案自动核算：答对 ${correctCount} / ${questions.value.length}。AI 解析仅用于说明和建议。`,
     advice,
     items,
+  }
+}
+
+function gradeQuestion(question, index) {
+  const answer = answers.value[index] || ''
+  const reference = question.correctAnswer || question.reference
+  return {
+    answer,
+    isCorrect: answerMatches(answer, reference),
+  }
+}
+
+function questionScore(isCorrect) {
+  if (!isCorrect || !questions.value.length) return 0
+  return Math.round(100 / questions.value.length)
+}
+
+async function saveQuizRecord(finalResult) {
+  try {
+    await invoke('save_quiz_record', {
+      record: buildQuizRecord(finalResult),
+      retentionDays: config.value?.record_retention_days ?? 7,
+    })
+  } catch (e) {
+    console.warn('淇濆瓨娴嬭瘯璁板綍澶辫触:', e)
+  }
+}
+
+function buildQuizRecord(finalResult) {
+  return {
+    level: level.value,
+    level_name: levelName.value,
+    exam_type: selectedExamType.value,
+    exam_type_name: examTypes.find(type => type.key === selectedExamType.value)?.label || selectedExamType.value,
+    quiz_size: questions.value.length,
+    created_at: new Date().toISOString(),
+    questions: questions.value.map((question, index) => ({
+      index: index + 1,
+      word: question.word.word,
+      type: question.type,
+      stem: question.stem,
+      options: question.options,
+      correct_answer: question.correctAnswer,
+      reference: question.reference,
+      explanation: question.explanation,
+      answer: answers.value[index] || '',
+      result: finalResult.items?.[index] || null,
+    })),
+    result: finalResult,
   }
 }
 
@@ -424,10 +504,26 @@ function plainDefinition(definition) {
 }
 
 function answerMatches(answer, reference) {
+  const rawAnswer = String(answer || '').trim()
+  const rawReference = String(reference || '').trim()
+  const answerChoice = extractChoice(rawAnswer)
+  const referenceChoice = extractChoice(rawReference)
+  if (referenceChoice) {
+    return answerChoice === referenceChoice || rawAnswer.toUpperCase() === referenceChoice
+  }
+
   const normalizedAnswer = normalize(answer)
   const normalizedReference = normalize(reference)
+  if (/^[a-z0-9]$/i.test(normalizedAnswer)) {
+    return normalizedAnswer === normalizedReference
+  }
   return Boolean(normalizedAnswer && normalizedReference)
     && (normalizedReference.includes(normalizedAnswer) || normalizedAnswer.includes(normalizedReference))
+}
+
+function extractChoice(value) {
+  const match = String(value || '').trim().match(/^([A-D])(?:[\s.、):：]|$)/i)
+  return match ? match[1].toUpperCase() : ''
 }
 
 function normalize(value) {

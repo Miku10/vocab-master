@@ -1,5 +1,12 @@
 <template>
-  <div class="flex h-screen bg-slate-50">
+  <div v-if="appLoading" class="grid h-screen place-items-center bg-slate-50">
+    <div class="text-center">
+      <div class="mx-auto mb-4 h-14 w-14 animate-spin rounded-2xl border-4 border-blue-100 border-t-blue-600"></div>
+      <p class="text-sm font-semibold text-slate-700">Vocab Master 正在加载...</p>
+    </div>
+  </div>
+
+  <div v-else class="flex h-screen bg-slate-50">
     <!-- 侧边栏 -->
     <aside class="w-64 bg-white border-r border-slate-200 flex flex-col">
       <!-- Logo -->
@@ -59,6 +66,7 @@ import Settings from './components/Settings.vue'
 const route = useRoute()
 const showSettings = ref(false)
 const needsSetup = ref(false)
+const appLoading = ref(true)
 
 const menuItems = [
   { path: '/', icon: '📊', label: '学习仪表盘' },
@@ -91,5 +99,6 @@ onMounted(async () => {
   } catch (e) {
     console.warn('读取配置失败:', e)
   }
+  appLoading.value = false
 })
 </script>

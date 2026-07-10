@@ -17,7 +17,7 @@
           </button>
         </div>
 
-        <div class="mt-4 grid grid-cols-4 gap-2 rounded-2xl bg-slate-100 p-1">
+        <div class="mt-4 grid grid-cols-2 gap-2 rounded-2xl bg-slate-100 p-1 sm:grid-cols-5">
           <button
             v-for="tab in tabs"
             :key="tab.key"
@@ -83,6 +83,10 @@
               <span class="label">音频缓存过期时间（小时）</span>
               <input v-model.number="config.audio_expire_hours" type="number" min="1" max="24" class="field" />
             </label>
+            <label class="mt-4 block">
+              <span class="label">测验记录和错题保留天数</span>
+              <input v-model.number="config.record_retention_days" type="number" min="1" max="365" class="field" />
+            </label>
           </div>
         </section>
 
@@ -140,6 +144,68 @@
             </div>
 
             <p v-if="importMessage" class="mt-3 text-sm text-emerald-600">{{ importMessage }}</p>
+          </div>
+        </section>
+
+        <section v-else-if="activeTab === 'records'" class="space-y-5">
+          <div class="panel">
+            <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 class="section-title mb-1">学习记录管理</h3>
+                <p class="text-sm text-slate-500">可清空学习进度、学习会话、测验记录，也可以删除单条记录。</p>
+              </div>
+              <button type="button" class="btn-secondary" @click="loadLearningRecords">刷新</button>
+            </div>
+
+            <div class="grid gap-3 sm:grid-cols-4">
+              <button type="button" class="danger-btn" @click="clearRecords('progress')">清空词卡进度</button>
+              <button type="button" class="danger-btn" @click="clearRecords('sessions')">清空学习会话</button>
+              <button type="button" class="danger-btn" @click="clearRecords('quizzes')">清空测验记录</button>
+              <button type="button" class="danger-btn" @click="clearRecords('all')">清空全部记录</button>
+            </div>
+
+            <div class="mt-4 rounded-xl bg-white p-4 ring-1 ring-slate-200">
+              <p class="text-sm text-slate-500">词卡进度记录</p>
+              <p class="mt-1 text-2xl font-bold text-slate-900">{{ learningRecords.progress_count || 0 }}</p>
+            </div>
+          </div>
+
+          <div class="grid gap-5 lg:grid-cols-2">
+            <div class="panel">
+              <h3 class="section-title">最近学习会话</h3>
+              <div v-if="recordLoading" class="py-8 text-center text-sm text-slate-500">正在读取...</div>
+              <div v-else-if="!learningRecords.sessions.length" class="py-8 text-center text-sm text-slate-500">暂无学习会话</div>
+              <div v-else class="space-y-3">
+                <div v-for="item in learningRecords.sessions" :key="item.id" class="rounded-xl bg-white p-3 ring-1 ring-slate-200">
+                  <div class="flex items-start justify-between gap-3">
+                    <div>
+                      <p class="font-semibold text-slate-900">{{ item.date }}</p>
+                      <p class="mt-1 text-sm text-slate-500">
+                        新词 {{ item.new_words }} · 复习 {{ item.reviewed_words }} · 正确 {{ item.correct_count }} · 错误 {{ item.incorrect_count }}
+                      </p>
+                    </div>
+                    <button type="button" class="text-sm font-semibold text-red-600 hover:text-red-700" @click="deleteRecord('session', item.id)">删除</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="panel">
+              <h3 class="section-title">最近测验记录</h3>
+              <div v-if="recordLoading" class="py-8 text-center text-sm text-slate-500">正在读取...</div>
+              <div v-else-if="!learningRecords.quizzes.length" class="py-8 text-center text-sm text-slate-500">暂无测验记录</div>
+              <div v-else class="space-y-3">
+                <div v-for="item in learningRecords.quizzes" :key="item.id" class="rounded-xl bg-white p-3 ring-1 ring-slate-200">
+                  <div class="flex items-start justify-between gap-3">
+                    <div>
+                      <p class="font-semibold text-slate-900">{{ item.date }} · {{ item.score }} 分</p>
+                      <p class="mt-1 line-clamp-2 text-sm text-slate-500">{{ item.summary || '暂无总结' }}</p>
+                    </div>
+                    <button type="button" class="text-sm font-semibold text-red-600 hover:text-red-700" @click="deleteRecord('quiz', item.id)">删除</button>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         </section>
 
@@ -251,6 +317,7 @@ const emit = defineEmits(['close'])
 const tabs = [
   { key: 'study', label: '学习' },
   { key: 'words', label: '词库' },
+  { key: 'records', label: '记录' },
   { key: 'ai', label: 'AI' },
   { key: 'search', label: '搜索' },
 ]
@@ -298,6 +365,7 @@ const config = reactive({
     timeout_seconds: 15,
   },
   audio_expire_hours: 5,
+  record_retention_days: 7,
   daily_new_words: 20,
   daily_review_words: 30,
   card_advance_mode: 'auto',
@@ -316,11 +384,18 @@ const importRawContent = ref('')
 const importPreview = ref([])
 const importStats = reactive({ total: 0, duplicates: 0 })
 const fileInput = ref(null)
+const recordLoading = ref(false)
+const learningRecords = reactive({
+  sessions: [],
+  quizzes: [],
+  progress_count: 0,
+})
 
 invoke('get_config').then(data => {
   if (data.model) Object.assign(config.model, data.model)
   if (data.search) Object.assign(config.search, data.search)
   config.audio_expire_hours = data.audio_expire_hours ?? config.audio_expire_hours
+  config.record_retention_days = data.record_retention_days ?? config.record_retention_days
   config.daily_new_words = data.daily_new_words ?? config.daily_new_words
   config.daily_review_words = data.daily_review_words ?? config.daily_review_words
   config.card_advance_mode = data.card_advance_mode || config.card_advance_mode
@@ -341,6 +416,12 @@ invoke('get_config').then(data => {
 watch(selectedPrompt, (val) => {
   if (val && config.prompts[val] !== undefined) {
     promptEdit.value = config.prompts[val]
+  }
+})
+
+watch(activeTab, (val) => {
+  if (val === 'records') {
+    loadLearningRecords()
   }
 })
 
@@ -434,6 +515,52 @@ function clearImportState(keepMessage) {
   if (!keepMessage) importMessage.value = ''
 }
 
+async function loadLearningRecords() {
+  recordLoading.value = true
+  try {
+    const data = await invoke('get_learning_records')
+    learningRecords.sessions = Array.isArray(data.sessions) ? data.sessions : []
+    learningRecords.quizzes = Array.isArray(data.quizzes) ? data.quizzes : []
+    learningRecords.progress_count = Number(data.progress_count || 0)
+  } catch (e) {
+    console.warn('读取学习记录失败:', e)
+    learningRecords.sessions = []
+    learningRecords.quizzes = []
+    learningRecords.progress_count = 0
+  } finally {
+    recordLoading.value = false
+  }
+}
+
+async function deleteRecord(recordType, id) {
+  if (!confirm('确认删除这条记录？')) return
+  try {
+    await invoke('delete_learning_record', {
+      recordType,
+      id,
+    })
+    await loadLearningRecords()
+  } catch (e) {
+    alert('删除失败: ' + e)
+  }
+}
+
+async function clearRecords(scope) {
+  const labels = {
+    progress: '词卡学习进度',
+    sessions: '学习会话',
+    quizzes: '测验记录',
+    all: '全部学习记录',
+  }
+  if (!confirm(`确认清空${labels[scope] || '记录'}？此操作不可恢复。`)) return
+  try {
+    await invoke('clear_learning_records', { scope })
+    await loadLearningRecords()
+  } catch (e) {
+    alert('清空失败: ' + e)
+  }
+}
+
 function addPrompt() {
   const name = prompt('请输入提示词名称:')
   if (name && !config.prompts[name]) {
@@ -455,6 +582,7 @@ async function saveAll() {
     config.daily_review_words = Math.max(0, Number(config.daily_review_words) || 0)
     config.card_detail_seconds = Math.min(10, Math.max(1, Number(config.card_detail_seconds) || 2))
     config.audio_expire_hours = Math.max(1, Number(config.audio_expire_hours) || 5)
+    config.record_retention_days = Math.min(365, Math.max(1, Number(config.record_retention_days) || 7))
     config.setup_complete = true
     await invoke('save_config', { config })
     emit('close')
@@ -537,5 +665,18 @@ async function saveAll() {
 
 .btn-secondary:hover {
   background: rgb(226 232 240);
+}
+
+.danger-btn {
+  border-radius: 0.75rem;
+  background: rgb(254 242 242);
+  padding: 0.625rem 1rem;
+  font-size: 0.875rem;
+  font-weight: 700;
+  color: rgb(220 38 38);
+}
+
+.danger-btn:hover {
+  background: rgb(254 226 226);
 }
 </style>

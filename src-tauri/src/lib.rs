@@ -119,6 +119,8 @@ pub struct AppConfig {
     pub model: ModelConfig,
     pub search: SearchConfig,
     pub audio_expire_hours: u64,
+    #[serde(default = "default_record_retention_days")]
+    pub record_retention_days: u32,
     #[serde(default = "default_daily_new_words")]
     pub daily_new_words: u32,
     #[serde(default = "default_daily_review_words")]
@@ -151,6 +153,7 @@ impl Default for AppConfig {
                 timeout_seconds: 15,
             },
             audio_expire_hours: 5,
+            record_retention_days: default_record_retention_days(),
             daily_new_words: default_daily_new_words(),
             daily_review_words: default_daily_review_words(),
             card_advance_mode: default_card_advance_mode(),
@@ -168,6 +171,10 @@ fn default_active_level() -> String {
 
 fn default_daily_new_words() -> u32 {
     20
+}
+
+fn default_record_retention_days() -> u32 {
+    7
 }
 
 fn default_daily_review_words() -> u32 {
@@ -239,6 +246,19 @@ fn init_tables(pool: &DbPool) -> Result<(), String> {
             created_at TEXT DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_ss_date ON study_sessions(date);
+
+        CREATE TABLE IF NOT EXISTS quiz_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            level TEXT NOT NULL,
+            score INTEGER DEFAULT 0,
+            summary TEXT,
+            advice TEXT,
+            payload TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_qr_created_at ON quiz_records(created_at);
+        CREATE INDEX IF NOT EXISTS idx_qr_level ON quiz_records(level);
         ",
     )
     .map_err(|e| e.to_string())?;
@@ -488,10 +508,47 @@ fn get_study_queue(
 /// 播放单词发音（Free Dictionary API）
 #[tauri::command]
 async fn play_word_audio(word: String) -> Result<String, String> {
+    cache_word_audio(&word).await
+}
+
+/// 标记单词为已掌握
+async fn cache_word_audio(word: &str) -> Result<String, String> {
+    let _ = cleanup_audio_cache(1);
     let client = reqwest::Client::new();
+    let audio_url = lookup_audio_url(&client, word).await?;
+    let cache_path = audio_cache_file_path(word, &audio_url)?;
+
+    let resp = client
+        .get(&audio_url)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("发音下载失败：{}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("发音下载失败：HTTP {}", resp.status()));
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("发音读取失败：{}", e))?;
+    if bytes.is_empty() {
+        return Err("发音文件为空".into());
+    }
+
+    if let Some(parent) = cache_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::write(&cache_path, bytes.as_ref()).map_err(|e| e.to_string())?;
+
+    Ok(cache_path.to_string_lossy().to_string())
+}
+
+async fn lookup_audio_url(client: &reqwest::Client, word: &str) -> Result<String, String> {
     let url = format!(
         "https://api.dictionaryapi.dev/api/v2/entries/en/{}",
-        urlencoding::encode(&word)
+        urlencoding::encode(word)
     );
 
     let resp = client
@@ -510,13 +567,12 @@ async fn play_word_audio(word: String) -> Result<String, String> {
         return Err(format!("未找到单词 '{}' 的发音", word));
     }
 
-    // Free Dictionary API returns audio under phonetics[].audio.
     let phonetics = &entries[0]["phonetics"];
     if let Some(arr) = phonetics.as_array() {
         for p in arr {
             if let Some(audio) = p["audio"].as_str() {
                 if !audio.is_empty() {
-                    return Ok(audio.to_string());
+                    return Ok(normalize_audio_url(audio));
                 }
             }
         }
@@ -525,7 +581,57 @@ async fn play_word_audio(word: String) -> Result<String, String> {
     Err(format!("单词 '{}' 没有可用的音频", word))
 }
 
-/// 标记单词为已掌握
+fn normalize_audio_url(url: &str) -> String {
+    if url.starts_with("//") {
+        format!("https:{}", url)
+    } else {
+        url.to_string()
+    }
+}
+
+fn audio_cache_file_path(word: &str, audio_url: &str) -> Result<PathBuf, String> {
+    let mut path = dirs::cache_dir().ok_or("无法获取缓存目录")?;
+    path.push("vocab-master-audio");
+
+    let file_name = safe_audio_file_name(word);
+    let extension = audio_url
+        .split('?')
+        .next()
+        .and_then(|path| path.rsplit('.').next())
+        .filter(|ext| {
+            !ext.is_empty() && ext.len() <= 5 && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        })
+        .unwrap_or("mp3");
+    path.push(format!(
+        "{}-{}.{}",
+        file_name,
+        chrono::Utc::now().timestamp_millis(),
+        extension
+    ));
+    Ok(path)
+}
+
+fn safe_audio_file_name(word: &str) -> String {
+    let sanitized: String = word
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    if sanitized.is_empty() {
+        "word".into()
+    } else {
+        sanitized
+    }
+}
+
 #[tauri::command]
 fn mark_word_learned(app: tauri::AppHandle, word: Word) -> Result<(), String> {
     let pool = get_db(&app)?;
@@ -612,7 +718,323 @@ fn save_progress(app: tauri::AppHandle, data: Value) -> Result<(), String> {
     Ok(())
 }
 
-/// 获取仪表盘数据（从 SQLite + JSON 混合读取）
+/// 保存完整测验记录
+#[tauri::command]
+fn save_quiz_record(
+    app: tauri::AppHandle,
+    record: Value,
+    retention_days: u32,
+) -> Result<(), String> {
+    let pool = get_db(&app)?;
+    let conn = pool.get().map_err(|e| e.to_string())?;
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let level = record
+        .get("level")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let null_result = Value::Null;
+    let result = record.get("result").unwrap_or(&null_result);
+    let score = result
+        .get("score")
+        .or_else(|| record.get("score"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    let summary = result
+        .get("summary")
+        .or_else(|| record.get("summary"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let advice = result
+        .get("advice")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(vec![]));
+    let advice_json = serde_json::to_string(&advice).map_err(|e| e.to_string())?;
+    let payload = serde_json::to_string(&record).map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "INSERT INTO quiz_records (date, level, score, summary, advice, payload)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![today, level, score, summary, advice_json, payload],
+    )
+    .map_err(|e| e.to_string())?;
+
+    cleanup_quiz_records(&conn, retention_days)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn get_quiz_records(app: tauri::AppHandle) -> Result<Vec<Value>, String> {
+    let pool = get_db(&app)?;
+    let conn = pool.get().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, date, level, score, summary, payload, created_at
+             FROM quiz_records
+             ORDER BY datetime(created_at) DESC, id DESC
+             LIMIT 50",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let date: String = row.get(1)?;
+            let level: String = row.get(2)?;
+            let score: i32 = row.get(3)?;
+            let summary: String = row.get(4)?;
+            let payload: String = row.get(5)?;
+            let created_at: String = row.get(6)?;
+            Ok((id, date, level, score, summary, payload, created_at))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut records = Vec::new();
+    for row in rows {
+        let (id, date, level, score, summary, payload, created_at) =
+            row.map_err(|e| e.to_string())?;
+        let mut record: Value = serde_json::from_str(&payload).unwrap_or_else(|_| json!({}));
+        if let Some(obj) = record.as_object_mut() {
+            obj.insert("id".into(), json!(id));
+            obj.insert("date".into(), json!(date));
+            obj.insert("level".into(), json!(level));
+            obj.insert("score".into(), json!(score));
+            obj.insert("summary".into(), json!(summary));
+            obj.insert("created_at".into(), json!(created_at));
+        }
+        records.push(record);
+    }
+
+    Ok(records)
+}
+
+#[tauri::command]
+fn get_wrong_book(app: tauri::AppHandle) -> Result<Vec<Value>, String> {
+    let pool = get_db(&app)?;
+    let conn = pool.get().map_err(|e| e.to_string())?;
+    let mut items = Vec::new();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT word, level, wrong_count, COALESCE(last_seen, '')
+             FROM word_progress
+             WHERE wrong_count > 0
+             ORDER BY wrong_count DESC, datetime(last_seen) DESC
+             LIMIT 100",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i32>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+
+    for row in rows {
+        let (word, level, wrong_count, last_seen) = row.map_err(|e| e.to_string())?;
+        items.push(json!({
+            "source": "word",
+            "word": word,
+            "level": level,
+            "wrong_count": wrong_count,
+            "created_at": last_seen,
+            "answer": "",
+            "analysis": "词卡学习中标记为不记得。",
+            "suggestion": "优先安排到复习队列，直到连续答对后再降低复习频率。"
+        }));
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT payload, created_at
+             FROM quiz_records
+             ORDER BY datetime(created_at) DESC, id DESC
+             LIMIT 50",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?;
+
+    for row in rows {
+        let (payload, created_at) = row.map_err(|e| e.to_string())?;
+        let record: Value = serde_json::from_str(&payload).unwrap_or_else(|_| json!({}));
+        let level = record
+            .get("level")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        if let Some(result_items) = record
+            .get("result")
+            .and_then(|result| result.get("items"))
+            .and_then(|items| items.as_array())
+        {
+            for item in result_items.iter().filter(|item| {
+                !item
+                    .get("is_correct")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            }) {
+                let word = item.get("word").and_then(|v| v.as_str()).unwrap_or("");
+                if word.is_empty() {
+                    continue;
+                }
+                items.push(json!({
+                    "source": "quiz",
+                    "word": word,
+                    "level": level,
+                    "wrong_count": 1,
+                    "created_at": created_at,
+                    "answer": item.get("answer").cloned().unwrap_or(Value::String(String::new())),
+                    "analysis": item.get("analysis").cloned().unwrap_or(Value::String(String::new())),
+                    "suggestion": item.get("suggestion").cloned().unwrap_or(Value::String(String::new()))
+                }));
+            }
+        }
+    }
+
+    Ok(items)
+}
+
+fn cleanup_quiz_records(conn: &Connection, retention_days: u32) -> Result<(), String> {
+    let days = retention_days.clamp(1, 3650);
+    let modifier = format!("-{} days", days);
+    conn.execute(
+        "DELETE FROM quiz_records WHERE datetime(created_at) < datetime('now', ?1)",
+        params![modifier],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn get_learning_records(app: tauri::AppHandle) -> Result<Value, String> {
+    let pool = get_db(&app)?;
+    let conn = pool.get().map_err(|e| e.to_string())?;
+
+    let mut session_stmt = conn
+        .prepare(
+            "SELECT id, date, new_words, reviewed_words, correct_count, incorrect_count, duration_seconds, created_at
+             FROM study_sessions
+             ORDER BY datetime(created_at) DESC, id DESC
+             LIMIT 50",
+        )
+        .map_err(|e| e.to_string())?;
+    let sessions = session_stmt
+        .query_map([], |row| {
+            Ok(json!({
+                "id": row.get::<_, i64>(0)?,
+                "date": row.get::<_, String>(1)?,
+                "new_words": row.get::<_, i32>(2)?,
+                "reviewed_words": row.get::<_, i32>(3)?,
+                "correct_count": row.get::<_, i32>(4)?,
+                "incorrect_count": row.get::<_, i32>(5)?,
+                "duration_seconds": row.get::<_, i32>(6)?,
+                "created_at": row.get::<_, String>(7)?,
+            }))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    let mut quiz_stmt = conn
+        .prepare(
+            "SELECT id, date, level, score, COALESCE(summary, ''), created_at
+             FROM quiz_records
+             ORDER BY datetime(created_at) DESC, id DESC
+             LIMIT 50",
+        )
+        .map_err(|e| e.to_string())?;
+    let quizzes = quiz_stmt
+        .query_map([], |row| {
+            Ok(json!({
+                "id": row.get::<_, i64>(0)?,
+                "date": row.get::<_, String>(1)?,
+                "level": row.get::<_, String>(2)?,
+                "score": row.get::<_, i32>(3)?,
+                "summary": row.get::<_, String>(4)?,
+                "created_at": row.get::<_, String>(5)?,
+            }))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    let progress_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM word_progress", [], |row| row.get(0))
+        .unwrap_or(0);
+
+    Ok(json!({
+        "sessions": sessions,
+        "quizzes": quizzes,
+        "progress_count": progress_count,
+    }))
+}
+
+#[tauri::command]
+fn delete_learning_record(
+    app: tauri::AppHandle,
+    record_type: String,
+    id: i64,
+) -> Result<(), String> {
+    let pool = get_db(&app)?;
+    let conn = pool.get().map_err(|e| e.to_string())?;
+    let sql = match record_type.as_str() {
+        "session" => "DELETE FROM study_sessions WHERE id = ?1",
+        "quiz" => "DELETE FROM quiz_records WHERE id = ?1",
+        _ => return Err("未知记录类型".into()),
+    };
+    conn.execute(sql, params![id]).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_learning_records(app: tauri::AppHandle, scope: String) -> Result<(), String> {
+    let pool = get_db(&app)?;
+    let conn = pool.get().map_err(|e| e.to_string())?;
+
+    match scope.as_str() {
+        "all" => {
+            conn.execute("DELETE FROM word_progress", [])
+                .map_err(|e| e.to_string())?;
+            conn.execute("DELETE FROM study_sessions", [])
+                .map_err(|e| e.to_string())?;
+            conn.execute("DELETE FROM quiz_records", [])
+                .map_err(|e| e.to_string())?;
+            remove_legacy_progress_file();
+        }
+        "progress" => {
+            conn.execute("DELETE FROM word_progress", [])
+                .map_err(|e| e.to_string())?;
+            remove_legacy_progress_file();
+        }
+        "sessions" => {
+            conn.execute("DELETE FROM study_sessions", [])
+                .map_err(|e| e.to_string())?;
+            remove_legacy_progress_file();
+        }
+        "quizzes" => {
+            conn.execute("DELETE FROM quiz_records", [])
+                .map_err(|e| e.to_string())?;
+        }
+        _ => return Err("未知清理范围".into()),
+    }
+
+    Ok(())
+}
+
+fn remove_legacy_progress_file() {
+    if let Some(mut path) = dirs::data_dir() {
+        path.push("vocab-master");
+        path.push("progress.json");
+        let _ = fs::remove_file(path);
+    }
+}
+
 #[tauri::command]
 fn get_dashboard_data(app: tauri::AppHandle) -> Result<DashboardData, String> {
     let config = get_config().unwrap_or_default();
@@ -1334,6 +1756,12 @@ pub fn run() {
             mark_word_hard,
             get_dashboard_data,
             save_progress,
+            save_quiz_record,
+            get_quiz_records,
+            get_wrong_book,
+            get_learning_records,
+            delete_learning_record,
+            clear_learning_records,
             get_config,
             save_config,
             call_model_api,
