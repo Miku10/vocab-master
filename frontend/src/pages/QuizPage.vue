@@ -3,13 +3,18 @@
     <div class="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
       <div>
         <p class="text-sm font-medium text-blue-600">{{ levelName }} · 模拟测试</p>
-        <h2 class="text-2xl font-bold text-slate-900">释义问答</h2>
+        <h2 class="text-2xl font-bold text-slate-900">中国考试题型训练</h2>
       </div>
-      <select v-model.number="quizSize" class="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700">
-        <option :value="5">5 题</option>
-        <option :value="10">10 题</option>
-        <option :value="15">15 题</option>
-      </select>
+      <div class="grid gap-2 sm:grid-cols-2">
+        <select v-model="selectedExamType" class="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700">
+          <option v-for="type in examTypes" :key="type.key" :value="type.key">{{ type.label }}</option>
+        </select>
+        <select v-model.number="quizSize" class="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700">
+          <option :value="5">5 题</option>
+          <option :value="10">10 题</option>
+          <option :value="15">15 题</option>
+        </select>
+      </div>
     </div>
 
     <div v-if="loading" class="rounded-2xl bg-white py-20 text-center text-slate-500 shadow-sm ring-1 ring-slate-100">
@@ -25,12 +30,17 @@
 
     <div v-else-if="!started" class="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-100 sm:p-8">
       <div class="mb-6">
-        <p class="text-sm font-medium text-slate-500">题目会优先抽取高频词</p>
+        <p class="text-sm font-medium text-slate-500">优先用 AI 按中国考试高频题型生成；未配置模型时使用本地释义默写兜底。</p>
         <h3 class="mt-1 text-2xl font-bold text-slate-900">准备开始 {{ Math.min(quizSize, words.length) }} 题测试</h3>
       </div>
       <button class="rounded-xl bg-blue-600 px-5 py-3 text-sm font-semibold text-white hover:bg-blue-700" @click="startQuiz">
         开始测试
       </button>
+    </div>
+
+    <div v-else-if="generating" class="rounded-2xl bg-white py-20 text-center text-slate-500 shadow-sm ring-1 ring-slate-100">
+      <div class="mb-3 inline-block animate-spin text-3xl">⟳</div>
+      <p>AI 正在生成中国考试题型...</p>
     </div>
 
     <div v-else-if="grading" class="rounded-2xl bg-white py-20 text-center text-slate-500 shadow-sm ring-1 ring-slate-100">
@@ -79,19 +89,36 @@
     </div>
 
     <form v-else class="space-y-4" @submit.prevent="submitQuiz">
-      <div v-for="(question, index) in questions" :key="question.word.id" class="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-100">
+      <div v-for="(question, index) in questions" :key="`${question.word.word}-${index}`" class="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-100">
         <div class="mb-4 flex items-center justify-between gap-3">
-          <span class="rounded-full bg-slate-100 px-3 py-1 text-sm font-semibold text-slate-600">第 {{ index + 1 }} 题</span>
+          <span class="rounded-full bg-slate-100 px-3 py-1 text-sm font-semibold text-slate-600">第 {{ index + 1 }} 题 · {{ question.type }}</span>
           <span class="text-sm text-slate-400">#{{ question.word.frequency }}</span>
         </div>
-        <label class="block">
-          <span class="mb-2 block text-2xl font-bold text-slate-900">{{ question.word.word }}</span>
+        <div class="block">
+          <span class="mb-2 block text-lg font-bold leading-7 text-slate-900">{{ question.stem }}</span>
+          <div v-if="question.options.length" class="mt-4 grid gap-2">
+            <label
+              v-for="option in question.options"
+              :key="option"
+              class="flex cursor-pointer items-start gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700 hover:bg-blue-50"
+            >
+              <input v-model="answers[index]" type="radio" :name="`q-${index}`" :value="option" class="mt-1" />
+              <span>{{ option }}</span>
+            </label>
+          </div>
           <input
+            v-else
+            v-model="answers[index]"
+            class="mt-4 w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-slate-900 outline-none focus:border-blue-500 focus:ring-4 focus:ring-blue-100"
+            placeholder="输入答案"
+          />
+          <input
+            v-if="question.options.length"
             v-model="answers[index]"
             class="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-slate-900 outline-none focus:border-blue-500 focus:ring-4 focus:ring-blue-100"
-            placeholder="输入你记得的中文释义"
+            placeholder="也可以手动输入答案"
           />
-        </label>
+        </div>
       </div>
 
       <div class="sticky bottom-4 rounded-2xl border border-slate-200 bg-white/95 p-3 shadow-lg backdrop-blur">
@@ -115,14 +142,26 @@ const levelOptions = [
   { key: 'primary', label: '小学' },
 ]
 
+const examTypes = [
+  { key: 'mixed', label: '综合题型' },
+  { key: 'single_choice', label: '单项选择' },
+  { key: 'cloze', label: '完形填空' },
+  { key: 'context_blank', label: '语境填空' },
+  { key: 'word_discrimination', label: '词义辨析' },
+  { key: 'grammar_collocation', label: '语法搭配' },
+  { key: 'reading_inference', label: '阅读词义推断' },
+]
+
 const config = ref(null)
 const level = ref('junior')
 const words = ref([])
 const questions = ref([])
 const answers = ref([])
 const quizSize = ref(10)
+const selectedExamType = ref('mixed')
 const loading = ref(false)
 const started = ref(false)
+const generating = ref(false)
 const grading = ref(false)
 const result = ref(null)
 
@@ -146,14 +185,23 @@ async function loadWords() {
   }
 }
 
-function startQuiz() {
+async function startQuiz() {
   result.value = null
   started.value = true
-  questions.value = words.value.slice(0, Math.min(quizSize.value, words.value.length)).map(word => ({
-    word,
-    reference: plainDefinition(word.definition),
-  }))
-  answers.value = questions.value.map(() => '')
+  generating.value = true
+  const seedWords = words.value.slice(0, Math.min(quizSize.value, words.value.length))
+
+  try {
+    questions.value = config.value?.model?.api_key
+      ? await generateAiQuestions(seedWords)
+      : buildLocalQuestions(seedWords)
+  } catch (e) {
+    console.warn('AI 生成题目失败，使用本地题目:', e)
+    questions.value = buildLocalQuestions(seedWords)
+  } finally {
+    answers.value = questions.value.map(() => '')
+    generating.value = false
+  }
 }
 
 async function submitQuiz() {
@@ -193,6 +241,10 @@ async function submitQuiz() {
             },
             questions: questions.value.map((question, index) => ({
               word: question.word.word,
+              type: question.type,
+              stem: question.stem,
+              options: question.options,
+              correct_answer: question.correctAnswer,
               reference: question.reference,
               answer: answers.value[index] || '',
             })),
@@ -214,15 +266,17 @@ async function submitQuiz() {
 function buildLocalResult() {
   const items = questions.value.map((question, index) => {
     const answer = answers.value[index] || ''
-    const isCorrect = answerMatches(answer, question.reference)
+    const isCorrect = question.correctAnswer
+      ? answerMatches(answer, question.correctAnswer)
+      : answerMatches(answer, question.reference)
     return {
       word: question.word.word,
       answer,
       is_correct: isCorrect,
       score: isCorrect ? 10 : 0,
       analysis: isCorrect
-        ? `答案命中了参考释义：${question.reference}`
-        : `参考释义：${question.reference}`,
+        ? `答案命中了参考答案：${question.correctAnswer || question.reference}`
+        : `参考答案：${question.correctAnswer || question.reference}。${question.explanation || ''}`,
       suggestion: isCorrect ? '保持复习节奏。' : '把这个词加入明日重点复习。',
     }
   })
@@ -237,6 +291,85 @@ function buildLocalResult() {
     advice: score >= 80 ? ['继续增加新词量', '保持每日复习'] : ['降低新词量', '优先复习错词'],
     items,
   }
+}
+
+async function generateAiQuestions(seedWords) {
+  const selectedType = examTypes.find(type => type.key === selectedExamType.value)?.label || '综合题型'
+  const content = await invoke('call_model_api', {
+    config: config.value,
+    messages: [
+      {
+        role: 'system',
+        content: '你是熟悉中国英语考试命题风格的老师。只返回 JSON，不要返回 Markdown。',
+      },
+      {
+        role: 'user',
+        content: JSON.stringify({
+          instruction: '请基于给定词表生成中国考试常见题型。题目要像中考、高考、四六级常见命题：重视语境、固定搭配、词义辨析、完形填空、阅读词义推断。每题必须有题干、选项、正确答案、解析。',
+          exam_type: selectedType,
+          count: Math.min(quizSize.value, seedWords.length),
+          schema: {
+            questions: [
+              {
+                word: 'target word',
+                type: '单项选择/完形填空/语境填空/词义辨析/语法搭配/阅读词义推断',
+                stem: '题干',
+                options: ['A. ...', 'B. ...', 'C. ...', 'D. ...'],
+                answer: 'A',
+                reference: '正确答案完整文本或中文释义',
+                explanation: '解析',
+              },
+            ],
+          },
+          words: seedWords.map(word => ({
+            word: word.word,
+            definition: plainDefinition(word.definition),
+            example: word.example,
+            frequency: word.frequency,
+          })),
+        }),
+      },
+    ],
+  })
+
+  const parsed = extractJson(content)
+  const generated = Array.isArray(parsed?.questions) ? parsed.questions : []
+  const normalized = generated
+    .slice(0, seedWords.length)
+    .map((item, index) => normalizeGeneratedQuestion(item, seedWords[index]))
+    .filter(Boolean)
+
+  return normalized.length ? normalized : buildLocalQuestions(seedWords)
+}
+
+function normalizeGeneratedQuestion(item, fallbackWord) {
+  const wordText = String(item?.word || fallbackWord.word)
+  const word = words.value.find(candidate => candidate.word.toLowerCase() === wordText.toLowerCase()) || fallbackWord
+  const options = Array.isArray(item?.options) ? item.options.map(String).filter(Boolean) : []
+  const answer = String(item?.answer || item?.correct_answer || '')
+  const reference = String(item?.reference || plainDefinition(word.definition))
+
+  return {
+    word,
+    type: String(item?.type || examTypes.find(type => type.key === selectedExamType.value)?.label || '综合题型'),
+    stem: String(item?.stem || `写出 ${word.word} 在考试语境中的含义。`),
+    options,
+    correctAnswer: answer || reference,
+    reference,
+    explanation: String(item?.explanation || ''),
+  }
+}
+
+function buildLocalQuestions(seedWords) {
+  return seedWords.map(word => ({
+    word,
+    type: '释义默写',
+    stem: `写出单词 “${word.word}” 的中文释义。`,
+    options: [],
+    correctAnswer: '',
+    reference: plainDefinition(word.definition),
+    explanation: '',
+  }))
 }
 
 function normalizeAiResult(parsed, fallback) {
@@ -293,7 +426,8 @@ function plainDefinition(definition) {
 function answerMatches(answer, reference) {
   const normalizedAnswer = normalize(answer)
   const normalizedReference = normalize(reference)
-  return normalizedAnswer.length >= 2 && normalizedReference.includes(normalizedAnswer)
+  return Boolean(normalizedAnswer && normalizedReference)
+    && (normalizedReference.includes(normalizedAnswer) || normalizedAnswer.includes(normalizedReference))
 }
 
 function normalize(value) {
@@ -302,6 +436,7 @@ function normalize(value) {
 
 function resetQuiz() {
   started.value = false
+  generating.value = false
   grading.value = false
   result.value = null
   questions.value = []

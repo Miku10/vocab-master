@@ -51,7 +51,10 @@ pub struct SearchResult {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DashboardData {
+    pub active_level: String,
+    pub total_words: String,
     pub total_learned: String,
+    pub unlearned_words: String,
     pub mastery_rate: String,
     pub streak_days: String,
     pub total_time: String,
@@ -502,25 +505,13 @@ async fn play_word_audio(word: String) -> Result<String, String> {
         return Err(format!("未找到单词 '{}' 的发音", word));
     }
 
-    // 尝试获取英音或美音音频 URL
+    // Free Dictionary API returns audio under phonetics[].audio.
     let phonetics = &entries[0]["phonetics"];
     if let Some(arr) = phonetics.as_array() {
         for p in arr {
-            if let (Some(audio), true) =
-                (p["audio"].as_str(), p["listen"].as_bool().unwrap_or(false))
-            {
+            if let Some(audio) = p["audio"].as_str() {
                 if !audio.is_empty() {
                     return Ok(audio.to_string());
-                }
-            }
-            if let (Some(_), true) = (
-                p["sourceUrl"].as_str(),
-                !p["sourceUrl"].as_str().unwrap_or("").is_empty(),
-            ) {
-                if let Some(url_val) = p["url"].as_str() {
-                    if !url_val.is_empty() {
-                        return Ok(url_val.to_string());
-                    }
                 }
             }
         }
@@ -616,20 +607,30 @@ fn save_progress(app: tauri::AppHandle, data: Value) -> Result<(), String> {
 /// 获取仪表盘数据（从 SQLite + JSON 混合读取）
 #[tauri::command]
 fn get_dashboard_data(app: tauri::AppHandle) -> Result<DashboardData, String> {
+    let config = get_config().unwrap_or_default();
+    let active_level = config.active_level;
+    let total_words = load_words(active_level.clone())
+        .map(|words| words.len() as i32)
+        .unwrap_or(0);
+
     match get_db(&app) {
-        Ok(pool) => get_dashboard_from_sqlite(&pool),
-        Err(_) => get_dashboard_from_json(),
+        Ok(pool) => get_dashboard_from_sqlite(&pool, &active_level, total_words),
+        Err(_) => get_dashboard_from_json(&active_level, total_words),
     }
 }
 
-fn get_dashboard_from_sqlite(pool: &DbPool) -> Result<DashboardData, String> {
+fn get_dashboard_from_sqlite(
+    pool: &DbPool,
+    active_level: &str,
+    total_words: i32,
+) -> Result<DashboardData, String> {
     let conn = pool.get().map_err(|e| e.to_string())?;
 
     // 总学习数
     let total_learned: i32 = conn
         .query_row(
-            "SELECT COUNT(*) FROM word_progress WHERE status != 'new'",
-            [],
+            "SELECT COUNT(*) FROM word_progress WHERE level = ?1 AND status != 'new'",
+            params![active_level],
             |row| row.get(0),
         )
         .unwrap_or(0);
@@ -637,12 +638,15 @@ fn get_dashboard_from_sqlite(pool: &DbPool) -> Result<DashboardData, String> {
     // 掌握率
     let mastered: i32 = conn
         .query_row(
-            "SELECT COUNT(*) FROM word_progress WHERE status = 'mastered'",
-            [],
+            "SELECT COUNT(*) FROM word_progress WHERE level = ?1 AND status = 'mastered'",
+            params![active_level],
             |row| row.get(0),
         )
         .unwrap_or(0);
-    let mastery_rate = if total_learned > 0 {
+    let unlearned_words = total_words.saturating_sub(total_learned);
+    let mastery_rate = if total_words > 0 {
+        (mastered as f64 / total_words as f64 * 100.0) as f32
+    } else if total_learned > 0 {
         (mastered as f64 / total_learned as f64 * 100.0) as f32
     } else {
         0.0
@@ -691,10 +695,10 @@ fn get_dashboard_from_sqlite(pool: &DbPool) -> Result<DashboardData, String> {
 
     // 错词 Top 10
     let mut stmt = conn
-        .prepare("SELECT word, wrong_count FROM word_progress WHERE wrong_count > 0 ORDER BY wrong_count DESC LIMIT 10")
+        .prepare("SELECT word, wrong_count FROM word_progress WHERE level = ?1 AND wrong_count > 0 ORDER BY wrong_count DESC LIMIT 10")
         .map_err(|e| e.to_string())?;
     let wrong_rows: Vec<(String, i32)> = stmt
-        .query_map([], |row| {
+        .query_map(params![active_level], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
         })
         .map_err(|e| e.to_string())?
@@ -715,7 +719,7 @@ fn get_dashboard_from_sqlite(pool: &DbPool) -> Result<DashboardData, String> {
         },
         ProgressItem {
             name: "未学习".into(),
-            value: 100 - total_learned as i32,
+            value: unlearned_words,
             color: "#e2e8f0".into(),
         },
     ];
@@ -757,7 +761,10 @@ fn get_dashboard_from_sqlite(pool: &DbPool) -> Result<DashboardData, String> {
         .collect();
 
     Ok(DashboardData {
+        active_level: active_level.to_string(),
+        total_words: total_words.to_string(),
         total_learned: total_learned.to_string(),
+        unlearned_words: unlearned_words.to_string(),
         mastery_rate: format!("{:.0}", mastery_rate),
         streak_days: format!("{}天", streak_days),
         total_time: total_time_str,
@@ -809,7 +816,7 @@ fn compute_streak(conn: &Connection) -> Result<i64, String> {
     Ok(streak)
 }
 
-fn get_dashboard_from_json() -> Result<DashboardData, String> {
+fn get_dashboard_from_json(active_level: &str, total_words: i32) -> Result<DashboardData, String> {
     let mut path = dirs::data_dir().expect("无法获取数据目录");
     path.push("vocab-master");
     path.push("progress.json");
@@ -854,10 +861,13 @@ fn get_dashboard_from_json() -> Result<DashboardData, String> {
             )
         };
 
+    let mastered = (total_learned as f32 * mastery_rate / 100.0) as i32;
+    let unlearned_words = total_words.saturating_sub(total_learned);
+
     let progress = vec![
         ProgressItem {
             name: "已掌握".into(),
-            value: (total_learned as f32 * mastery_rate / 100.0) as i32,
+            value: mastered,
             color: "#10b981".into(),
         },
         ProgressItem {
@@ -867,7 +877,7 @@ fn get_dashboard_from_json() -> Result<DashboardData, String> {
         },
         ProgressItem {
             name: "未学习".into(),
-            value: 100 - total_learned,
+            value: unlearned_words,
             color: "#e2e8f0".into(),
         },
     ];
@@ -961,7 +971,10 @@ fn get_dashboard_from_json() -> Result<DashboardData, String> {
     };
 
     Ok(DashboardData {
+        active_level: active_level.to_string(),
+        total_words: total_words.to_string(),
         total_learned: total_learned.to_string(),
+        unlearned_words: unlearned_words.to_string(),
         mastery_rate: format!("{:.0}", mastery_rate),
         streak_days: format!("{}天", streak_days),
         total_time,

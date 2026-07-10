@@ -36,6 +36,7 @@
           <span class="text-lg">⚙️</span>
           <span>设置</span>
         </button>
+        <p class="mt-3 px-4 text-xs text-slate-400">© 2026 miku</p>
       </div>
     </aside>
 

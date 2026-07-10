@@ -1,7 +1,7 @@
 <template>
   <div class="space-y-6 p-2">
     <!-- 统计卡片 -->
-    <div class="grid grid-cols-4 gap-4">
+    <div class="grid grid-cols-2 gap-4 lg:grid-cols-6">
       <div v-for="stat in stats" :key="stat.label"
            class="bg-white rounded-2xl p-5 shadow-sm border border-slate-100 hover:shadow-md transition-shadow">
         <div class="flex items-center justify-between">
@@ -48,7 +48,9 @@ const trendChart = ref(null)
 const wrongChart = ref(null)
 
 const stats = reactive([
+  { label: '词库总量', value: '0', icon: '📚', iconBg: 'bg-slate-50' },
   { label: '已学单词', value: '0', icon: '📝', iconBg: 'bg-blue-50' },
+  { label: '未学单词', value: '0', icon: '○', iconBg: 'bg-slate-50' },
   { label: '掌握率', value: '0%', icon: '✅', iconBg: 'bg-green-50' },
   { label: '连续学习', value: '0天', icon: '🔥', iconBg: 'bg-orange-50' },
   { label: '学习时长', value: '0h', icon: '⏱️', iconBg: 'bg-purple-50' },
@@ -118,22 +120,23 @@ function initCharts() {
 async function loadData() {
   try {
     const data = await invoke('get_dashboard_data')
-    stats[0].value = data.total_learned
-    stats[1].value = data.mastery_rate + '%'
-    stats[2].value = data.streak_days
-    stats[3].value = data.total_time
+    stats[0].value = data.total_words
+    stats[1].value = data.total_learned
+    stats[2].value = data.unlearned_words
+    stats[3].value = data.mastery_rate + '%'
+    stats[4].value = data.streak_days
+    stats[5].value = data.total_time
 
     // Update progress chart
     const c1 = echarts.getInstanceByDom(progressChart.value)
     if (c1) {
-      const learned = parseInt(data.total_learned) || 0
-      const rate = parseFloat(data.mastery_rate) || 0
+      const progress = Array.isArray(data.progress) ? data.progress : []
       c1.setOption({
-        series: [{ data: [
-          { value: Math.round(learned * rate / 100), name: '已掌握', itemStyle: { color: '#10b981' } },
-          { value: learned - Math.round(learned * rate / 100), name: '学习中', itemStyle: { color: '#3b82f6' } },
-          { value: Math.max(0, 100 - learned), name: '未学习', itemStyle: { color: '#e2e8f0' } },
-        ]}]
+        series: [{ data: progress.map(item => ({
+          value: item.value,
+          name: item.name,
+          itemStyle: { color: item.color },
+        }))}]
       })
     }
 

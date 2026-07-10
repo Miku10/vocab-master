@@ -99,6 +99,19 @@
                 <span v-if="currentWord.phonetic_en">英 {{ currentWord.phonetic_en }}</span>
                 <span v-if="currentWord.phonetic_us">美 {{ currentWord.phonetic_us }}</span>
               </div>
+              <div class="mt-4 flex flex-wrap items-center gap-3 text-sm">
+                <button
+                  class="rounded-xl bg-blue-50 px-4 py-2 font-semibold text-blue-700 hover:bg-blue-100 disabled:cursor-wait disabled:opacity-60"
+                  :disabled="audioLoading"
+                  @click="playPronunciation"
+                >
+                  {{ audioButtonText }}
+                </button>
+                <span :class="audioError ? 'text-red-600' : 'text-slate-500'">{{ audioStatusText }}</span>
+                <a v-if="audioUrl" :href="audioUrl" target="_blank" class="font-medium text-slate-500 hover:text-blue-700">
+                  音频源
+                </a>
+              </div>
             </div>
             <button class="rounded-xl bg-slate-100 px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-200" @click="goNextNow">
               {{ cardAdvanceMode === 'manual' ? '继续' : '立即下一个' }}
@@ -147,6 +160,9 @@ const showDetail = ref(false)
 const lastRemembered = ref(false)
 const sessionComplete = ref(false)
 const nextPlan = ref('')
+const audioUrl = ref('')
+const audioLoading = ref(false)
+const audioError = ref('')
 let advanceTimer = null
 
 const sessionStats = reactive({
@@ -171,6 +187,16 @@ const accuracyPercent = computed(() => {
 const detailStatusText = computed(() => {
   if (cardAdvanceMode.value === 'manual') return '详情已展开，点击继续进入下一个单词'
   return `${cardDetailSeconds.value} 秒后自动进入下一个单词`
+})
+const audioStatusText = computed(() => {
+  if (audioLoading.value) return '正在获取发音...'
+  if (audioError.value) return audioError.value
+  if (audioUrl.value) return '发音已获取'
+  return '等待发音接口返回'
+})
+const audioButtonText = computed(() => {
+  if (audioLoading.value) return '获取中'
+  return audioUrl.value ? '播放发音' : '获取发音'
 })
 const progressPercent = computed(() => {
   if (queueItems.value.length === 0) return 0
@@ -204,6 +230,7 @@ async function loadStudyQueue() {
   loading.value = true
   sessionComplete.value = false
   showDetail.value = false
+  resetAudioState()
   currentIndex.value = 0
   nextPlan.value = ''
   resetStats()
@@ -233,8 +260,10 @@ async function loadStudyQueue() {
 async function answerMemory(remembered) {
   if (showDetail.value || !currentWord.value.word) return
   clearAdvanceTimer()
+  resetAudioState()
   lastRemembered.value = remembered
   showDetail.value = true
+  fetchPronunciation()
 
   try {
     if (remembered) {
@@ -263,6 +292,7 @@ function goNextNow() {
   if (currentIndex.value < queueItems.value.length - 1) {
     currentIndex.value++
     showDetail.value = false
+    resetAudioState()
     lastRemembered.value = false
     return
   }
@@ -272,6 +302,7 @@ function goNextNow() {
 async function completeSession() {
   sessionComplete.value = true
   showDetail.value = false
+  resetAudioState()
   currentIndex.value = queueItems.value.length
   await saveSessionProgress()
   await generateNextPlan()
@@ -345,5 +376,48 @@ function clearAdvanceTimer() {
     window.clearTimeout(advanceTimer)
     advanceTimer = null
   }
+}
+
+async function fetchPronunciation() {
+  if (!currentWord.value.word) return
+  const requestedWord = currentWord.value.word
+  audioLoading.value = true
+  audioError.value = ''
+  audioUrl.value = ''
+
+  try {
+    const url = await invoke('play_word_audio', { word: requestedWord })
+    if (currentWord.value.word === requestedWord) {
+      audioUrl.value = url
+    }
+  } catch (e) {
+    if (currentWord.value.word === requestedWord) {
+      audioError.value = `发音获取失败：${e}`
+    }
+  } finally {
+    if (currentWord.value.word === requestedWord) {
+      audioLoading.value = false
+    }
+  }
+}
+
+async function playPronunciation() {
+  if (!audioUrl.value) {
+    await fetchPronunciation()
+  }
+  if (!audioUrl.value) return
+
+  try {
+    const audio = new Audio(audioUrl.value)
+    await audio.play()
+  } catch (e) {
+    audioError.value = `播放失败：${e}`
+  }
+}
+
+function resetAudioState() {
+  audioUrl.value = ''
+  audioLoading.value = false
+  audioError.value = ''
 }
 </script>
