@@ -17,9 +17,11 @@ jobs:
         with:
           node-version: '22'
 
-      # 前端依赖安装（仍在 frontend 目录）
+      - name: Install root deps (@tauri-apps/cli)
+        run: npm ci
+
       - name: Install frontend deps
-        run: npm install
+        run: npm ci
         working-directory: frontend
 
       - name: Install Rust stable
@@ -34,10 +36,8 @@ jobs:
             src-tauri/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      # 构建 Tauri 安装程序（工作目录在项目根目录，通过 npx --prefix 调用 frontend 中的 CLI）
       - name: Build NSIS installer
-        run: npx --prefix frontend tauri build --bundles nsis
-        # 默认 working-directory 为项目根目录（即 checkout 的根），无需显式指定
+        run: npm run tauri:build
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
