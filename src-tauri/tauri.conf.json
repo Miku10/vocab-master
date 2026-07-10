@@ -29,10 +29,16 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "icon": ["../icons/32x32.png", "../icons/128x128.png", "../icons/256x256.png"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
     "windows": {
       "nsis": {
-        "installerIcon": "../icons/256x256.png",
+        "installerIcon": "icons/icon.ico",
         "installMode": "both",
         "displayLanguageSelector": true,
         "languages": ["SimpChinese", "English"]
