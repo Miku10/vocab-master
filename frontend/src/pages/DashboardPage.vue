@@ -47,6 +47,7 @@
 <script setup>
 import { ref, onMounted, nextTick, reactive } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import * as echarts from 'echarts'
 
 const progressChart = ref(null)
 const levelChart = ref(null)

@@ -3,8 +3,8 @@
   "version": "1.0.0",
   "scripts": {
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build",
-    "tauri:build:debug": "tauri build --debug"
+    "tauri:build": "tauri build --ci --bundles nsis",
+    "tauri:build:debug": "tauri build --debug --bundles nsis"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

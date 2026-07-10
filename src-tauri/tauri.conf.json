@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Vocab Master",
+  "version": "1.0.0",
+  "identifier": "com.vocabmaster.app",
+  "build": {
+    "beforeDevCommand": "npm run dev --prefix frontend",
+    "beforeBuildCommand": "npm run build --prefix frontend",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../frontend/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Vocab Master - 英语词汇大师",
+        "width": 1280,
+        "height": 850,
+        "minWidth": 1000,
+        "minHeight": 700,
+        "resizable": true,
+        "center": true,
+        "titleBarStyle": "Visible"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["../icons/32x32.png", "../icons/128x128.png", "../icons/256x256.png"],
+    "windows": {
+      "nsis": {
+        "installerIcon": "../icons/256x256.png",
+        "installMode": "both",
+        "displayLanguageSelector": true,
+        "languages": ["SimpChinese", "English"]
+      }
+    }
+  },
+  "plugins": {}
+}
