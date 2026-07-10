@@ -235,12 +235,17 @@ fn init_tables(pool: &DbPool) -> Result<(), String> {
             reviewed_words INTEGER DEFAULT 0,
             correct_count INTEGER DEFAULT 0,
             incorrect_count INTEGER DEFAULT 0,
+            duration_seconds INTEGER DEFAULT 0,
             created_at TEXT DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_ss_date ON study_sessions(date);
         ",
     )
     .map_err(|e| e.to_string())?;
+    let _ = conn.execute(
+        "ALTER TABLE study_sessions ADD COLUMN duration_seconds INTEGER DEFAULT 0",
+        [],
+    );
     Ok(())
 }
 
@@ -582,14 +587,17 @@ fn save_progress(app: tauri::AppHandle, data: Value) -> Result<(), String> {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
     conn.execute(
-        "INSERT INTO study_sessions (date, new_words, reviewed_words, correct_count, incorrect_count)
-         VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO study_sessions (date, new_words, reviewed_words, correct_count, incorrect_count, duration_seconds)
+         VALUES (?, ?, ?, ?, ?, ?)",
         params![
             today,
             data.get("new_words").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             data.get("reviewed_words").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             data.get("correct_count").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             data.get("incorrect_count").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            data.get("duration_seconds")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -655,19 +663,15 @@ fn get_dashboard_from_sqlite(
     // 连续学习天数
     let streak_days = compute_streak(&*conn)?;
 
-    // 总学习时长（基于会话记录估算）
-    let total_time: i64 = conn
+    // 总学习时长（基于真实会话耗时）
+    let total_seconds: i64 = conn
         .query_row(
-            "SELECT COALESCE(SUM(new_words + reviewed_words), 0) FROM study_sessions",
+            "SELECT COALESCE(SUM(duration_seconds), 0) FROM study_sessions",
             [],
             |row| row.get(0),
         )
         .unwrap_or(0);
-    let total_time_str = if total_time > 0 {
-        format!("{}h", total_time / 10)
-    } else {
-        "0h".to_string()
-    };
+    let total_time_str = format_duration(total_seconds);
 
     // 各学段掌握度
     let mut stmt = conn
@@ -814,6 +818,25 @@ fn compute_streak(conn: &Connection) -> Result<i64, String> {
     }
 
     Ok(streak)
+}
+
+fn format_duration(total_seconds: i64) -> String {
+    if total_seconds <= 0 {
+        return "0分钟".into();
+    }
+
+    let minutes = ((total_seconds as f64) / 60.0).ceil() as i64;
+    if minutes < 60 {
+        format!("{}分钟", minutes)
+    } else {
+        let hours = minutes / 60;
+        let rest = minutes % 60;
+        if rest == 0 {
+            format!("{}小时", hours)
+        } else {
+            format!("{}小时{}分钟", hours, rest)
+        }
+    }
 }
 
 fn get_dashboard_from_json(active_level: &str, total_words: i32) -> Result<DashboardData, String> {

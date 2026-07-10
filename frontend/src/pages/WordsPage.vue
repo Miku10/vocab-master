@@ -48,9 +48,14 @@
         <p class="mb-2 font-semibold text-blue-800">明日学习计划</p>
         <p class="whitespace-pre-line">{{ nextPlan || '正在生成明日计划...' }}</p>
       </div>
-      <button class="mt-6 rounded-xl bg-blue-600 px-5 py-3 text-sm font-semibold text-white hover:bg-blue-700" @click="loadStudyQueue">
-        重新生成今日队列
-      </button>
+      <div class="mt-6 flex flex-col gap-3 sm:flex-row">
+        <button class="rounded-xl bg-blue-600 px-5 py-3 text-sm font-semibold text-white hover:bg-blue-700" @click="startExtraStudy">
+          加学
+        </button>
+        <p class="text-sm leading-6 text-slate-500">
+          今天会保留同一份明日计划；加学完成后才会更新它。
+        </p>
+      </div>
     </div>
 
     <div v-else-if="queueItems.length === 0" class="rounded-2xl bg-white py-20 text-center shadow-sm ring-1 ring-slate-100">
@@ -160,10 +165,12 @@ const showDetail = ref(false)
 const lastRemembered = ref(false)
 const sessionComplete = ref(false)
 const nextPlan = ref('')
+const extraStudyMode = ref(false)
 const audioUrl = ref('')
 const audioLoading = ref(false)
 const audioError = ref('')
 let advanceTimer = null
+let sessionStartedAt = 0
 
 const sessionStats = reactive({
   newWords: 0,
@@ -225,8 +232,9 @@ onBeforeUnmount(() => {
   clearAdvanceTimer()
 })
 
-async function loadStudyQueue() {
+async function loadStudyQueue(options = {}) {
   clearAdvanceTimer()
+  extraStudyMode.value = Boolean(options.extra)
   loading.value = true
   sessionComplete.value = false
   showDetail.value = false
@@ -234,6 +242,7 @@ async function loadStudyQueue() {
   currentIndex.value = 0
   nextPlan.value = ''
   resetStats()
+  sessionStartedAt = Date.now()
 
   try {
     const config = await invoke('get_config')
@@ -305,7 +314,7 @@ async function completeSession() {
   resetAudioState()
   currentIndex.value = queueItems.value.length
   await saveSessionProgress()
-  await generateNextPlan()
+  await generateNextPlan({ force: extraStudyMode.value })
 }
 
 async function saveSessionProgress() {
@@ -316,6 +325,7 @@ async function saveSessionProgress() {
         reviewed_words: sessionStats.reviewWords,
         correct_count: sessionStats.remembered,
         incorrect_count: sessionStats.forgotten,
+        duration_seconds: sessionDurationSeconds(),
       },
     })
   } catch (e) {
@@ -323,7 +333,15 @@ async function saveSessionProgress() {
   }
 }
 
-async function generateNextPlan() {
+async function generateNextPlan({ force = false } = {}) {
+  if (!force) {
+    const cached = readCachedNextPlan()
+    if (cached) {
+      nextPlan.value = cached
+      return
+    }
+  }
+
   const fallback = `明天建议学习 ${plannedNewWords.value} 个新词，复习 ${plannedReviewWords.value} 个单词。\n安排理由：今天不记得 ${sessionStats.forgotten} 个，优先复习薄弱词可以稳住记忆曲线。`
   const config = appConfig.value
   if (!config?.model?.api_key) {
@@ -333,7 +351,7 @@ async function generateNextPlan() {
   }
 
   try {
-    const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+    const tomorrow = dateKey(1)
     const content = await invoke('call_model_api', {
       config,
       messages: [
@@ -359,9 +377,44 @@ async function generateNextPlan() {
 function saveNextPlan(content) {
   localStorage.setItem('vocab-master-next-plan', JSON.stringify({
     createdAt: new Date().toISOString(),
+    createdForDate: dateKey(0),
+    planDate: dateKey(1),
     level: currentLevel.value,
     content,
   }))
+}
+
+function readCachedNextPlan() {
+  try {
+    const raw = localStorage.getItem('vocab-master-next-plan')
+    if (!raw) return ''
+    const cached = JSON.parse(raw)
+    if (cached?.planDate === dateKey(1) && cached?.level === currentLevel.value && cached?.content) {
+      return cached.content
+    }
+  } catch {
+    return ''
+  }
+  return ''
+}
+
+function startExtraStudy() {
+  loadStudyQueue({ extra: true })
+}
+
+function sessionDurationSeconds() {
+  if (!sessionStartedAt) return 0
+  const elapsed = Math.round((Date.now() - sessionStartedAt) / 1000)
+  return Math.max(1, elapsed)
+}
+
+function dateKey(offsetDays) {
+  const date = new Date()
+  date.setDate(date.getDate() + offsetDays)
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
 }
 
 function resetStats() {
