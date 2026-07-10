@@ -1,3 +1,4 @@
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -149,8 +150,7 @@ fn create_pool() -> Result<DbPool, String> {
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let manager = r2d2_sqlite::SqliteConnectionManager::file(&db_path)
-        .map_err(|e| e.to_string())?;
+    let manager = r2d2_sqlite::SqliteConnectionManager::file(&db_path);
     r2d2::Pool::builder()
         .max_size(4)
         .build(manager)
@@ -196,7 +196,7 @@ fn init_tables(pool: &DbPool) -> Result<(), String> {
 
 /// 从 Tauri 状态或创建新连接池获取数据库
 fn get_db(app: &tauri::AppHandle) -> Result<DbPool, String> {
-    if let Ok(state) = app.state::<DbPool>().get() {
+    if let Some(state) = app.try_state::<DbPool>() {
         return Ok(state.inner().clone());
     }
     let pool = create_pool()?;
@@ -271,7 +271,9 @@ async fn play_word_audio(word: String) -> Result<String, String> {
     let phonetics = &entries[0]["phonetics"];
     if let Some(arr) = phonetics.as_array() {
         for p in arr {
-            if let (Some(audio), true) = (p["audio"].as_str(), p["listen"].as_bool().unwrap_or(false)) {
+            if let (Some(audio), true) =
+                (p["audio"].as_str(), p["listen"].as_bool().unwrap_or(false))
+            {
                 if !audio.is_empty() {
                     return Ok(audio.to_string());
                 }
@@ -301,7 +303,7 @@ fn mark_word_learned(app: tauri::AppHandle, word_id: i32) -> Result<(), String> 
     conn.execute(
         "INSERT OR REPLACE INTO word_progress (word_id, status, last_seen, review_count, correct_count, next_review)
          VALUES (?, 'mastered', ?, 1, 1, datetime('now', '+30 days'))",
-        [word_id, now],
+        params![word_id, now],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -316,7 +318,7 @@ fn mark_word_hard(app: tauri::AppHandle, word_id: i32) -> Result<(), String> {
     conn.execute(
         "INSERT OR REPLACE INTO word_progress (word_id, status, last_seen, review_count, wrong_count, next_review)
          VALUES (?, 'hard', ?, 1, 1, datetime('now', '+1 day'))",
-        [word_id, now],
+        params![word_id, now],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -332,8 +334,8 @@ fn save_progress(app: tauri::AppHandle, data: Value) -> Result<(), String> {
     conn.execute(
         "INSERT INTO study_sessions (date, new_words, reviewed_words, correct_count, incorrect_count)
          VALUES (?, ?, ?, ?, ?)",
-        [
-            &today,
+        params![
+            today,
             data.get("new_words").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             data.get("reviewed_words").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             data.get("correct_count").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
@@ -388,7 +390,7 @@ fn get_dashboard_from_sqlite(pool: &DbPool) -> Result<DashboardData, String> {
     };
 
     // 连续学习天数
-    let streak_days = compute_streak(&conn)?;
+    let streak_days = compute_streak(&*conn)?;
 
     // 总学习时长（基于会话记录估算）
     let total_time: i64 = conn
@@ -405,31 +407,37 @@ fn get_dashboard_from_sqlite(pool: &DbPool) -> Result<DashboardData, String> {
     };
 
     // 各学段掌握度
-    let level_rows: Vec<(String, i32)> = conn
-        .query_map(
-            "SELECT level, COUNT(*) FROM word_progress GROUP BY level ORDER BY level",
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+    let mut stmt = conn
+        .prepare("SELECT level, COUNT(*) FROM word_progress GROUP BY level ORDER BY level")
+        .map_err(|e| e.to_string())?;
+    let level_rows: Vec<(String, i32)> = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
+        })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
 
     // 每日趋势
-    let daily_rows: Vec<(String, i32)> = conn
-        .query_map(
-            "SELECT date, (new_words + reviewed_words) as cnt FROM study_sessions ORDER BY date DESC LIMIT 30",
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+    let mut stmt = conn
+        .prepare("SELECT date, (new_words + reviewed_words) as cnt FROM study_sessions ORDER BY date DESC LIMIT 30")
+        .map_err(|e| e.to_string())?;
+    let daily_rows: Vec<(String, i32)> = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
+        })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
 
     // 错词 Top 10
-    let wrong_rows: Vec<(String, i32)> = conn
-        .query_map(
-            "SELECT word, wrong_count FROM word_progress WHERE wrong_count > 0 ORDER BY wrong_count DESC LIMIT 10",
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+    let mut stmt = conn
+        .prepare("SELECT word, wrong_count FROM word_progress WHERE wrong_count > 0 ORDER BY wrong_count DESC LIMIT 10")
+        .map_err(|e| e.to_string())?;
+    let wrong_rows: Vec<(String, i32)> = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
+        })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
@@ -501,12 +509,12 @@ fn get_dashboard_from_sqlite(pool: &DbPool) -> Result<DashboardData, String> {
     })
 }
 
-fn compute_streak(conn: &r2d2::Connection) -> Result<i64, String> {
-    let dates: Vec<String> = conn
-        .query_map(
-            "SELECT DISTINCT date FROM study_sessions ORDER BY date DESC",
-            |row| row.get(0),
-        )
+fn compute_streak(conn: &Connection) -> Result<i64, String> {
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT date FROM study_sessions ORDER BY date DESC")
+        .map_err(|e| e.to_string())?;
+    let dates: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))
         .map_err(|e| e.to_string())?
         .filter_map(|r| r.ok())
         .collect();
@@ -519,7 +527,7 @@ fn compute_streak(conn: &r2d2::Connection) -> Result<i64, String> {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let mut expected = chrono::NaiveDate::parse_from_str(&today, "%Y-%m-%d")
         .ok()
-        .unwrap_or_else(|| chrono::NaiveDate::from_timestamp_opt(0, 0).unwrap());
+        .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
 
     for date_str in dates {
         if let Ok(d) = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d") {
@@ -616,10 +624,7 @@ fn get_dashboard_from_json() -> Result<DashboardData, String> {
                     .and_then(|n| n.as_str())
                     .unwrap_or("")
                     .to_string(),
-                value: v
-                    .get("value")
-                    .and_then(|n| n.as_i64())
-                    .unwrap_or(0) as i32,
+                value: v.get("value").and_then(|n| n.as_i64()).unwrap_or(0) as i32,
                 color: v
                     .get("color")
                     .and_then(|n| n.as_str())
@@ -668,10 +673,7 @@ fn get_dashboard_from_json() -> Result<DashboardData, String> {
                     .and_then(|n| n.as_str())
                     .unwrap_or("")
                     .to_string(),
-                count: v
-                    .get("count")
-                    .and_then(|n| n.as_i64())
-                    .unwrap_or(0) as i32,
+                count: v.get("count").and_then(|n| n.as_i64()).unwrap_or(0) as i32,
             })
             .collect()
     } else {
@@ -692,10 +694,7 @@ fn get_dashboard_from_json() -> Result<DashboardData, String> {
                     .and_then(|n| n.as_str())
                     .unwrap_or("")
                     .to_string(),
-                count: v
-                    .get("count")
-                    .and_then(|n| n.as_i64())
-                    .unwrap_or(0) as i32,
+                count: v.get("count").and_then(|n| n.as_i64()).unwrap_or(0) as i32,
             })
             .collect()
     } else {
@@ -901,7 +900,10 @@ async fn web_search(config: AppConfig, query: String) -> Result<Vec<SearchResult
         }
     };
 
-    Ok(results.into_iter().take(config.search.search_count).collect())
+    Ok(results
+        .into_iter()
+        .take(config.search.search_count)
+        .collect())
 }
 
 fn parse_bing_html(html: &str) -> Vec<SearchResult> {
@@ -932,7 +934,11 @@ fn parse_bing_html(html: &str) -> Vec<SearchResult> {
             .unwrap_or_default();
 
         if !title.is_empty() {
-            results.push(SearchResult { title, url, snippet });
+            results.push(SearchResult {
+                title,
+                url,
+                snippet,
+            });
         }
     }
     results
@@ -966,7 +972,11 @@ fn parse_duckduckgo_html(html: &str) -> Vec<SearchResult> {
             .unwrap_or_default();
 
         if !title.is_empty() {
-            results.push(SearchResult { title, url, snippet });
+            results.push(SearchResult {
+                title,
+                url,
+                snippet,
+            });
         }
     }
     results
