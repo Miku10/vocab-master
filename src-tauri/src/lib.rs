@@ -120,6 +120,10 @@ pub struct AppConfig {
     pub daily_new_words: u32,
     #[serde(default = "default_daily_review_words")]
     pub daily_review_words: u32,
+    #[serde(default = "default_card_advance_mode")]
+    pub card_advance_mode: String,
+    #[serde(default = "default_card_detail_seconds")]
+    pub card_detail_seconds: u32,
     #[serde(default = "default_active_level")]
     pub active_level: String,
     #[serde(default)]
@@ -146,6 +150,8 @@ impl Default for AppConfig {
             audio_expire_hours: 5,
             daily_new_words: default_daily_new_words(),
             daily_review_words: default_daily_review_words(),
+            card_advance_mode: default_card_advance_mode(),
+            card_detail_seconds: default_card_detail_seconds(),
             active_level: default_active_level(),
             setup_complete: false,
             prompts: HashMap::new(),
@@ -163,6 +169,14 @@ fn default_daily_new_words() -> u32 {
 
 fn default_daily_review_words() -> u32 {
     30
+}
+
+fn default_card_advance_mode() -> String {
+    "auto".into()
+}
+
+fn default_card_detail_seconds() -> u32 {
+    2
 }
 
 // ==================== 类型别名 ====================
@@ -400,7 +414,8 @@ fn get_study_queue(
     new_count: u32,
     review_count: u32,
 ) -> Result<Vec<StudyQueueItem>, String> {
-    let words = load_words(level.clone())?;
+    let mut words = load_words(level.clone())?;
+    words.sort_by_key(|word| (word.frequency, word.id));
     let word_map: HashMap<i32, Word> = words.iter().cloned().map(|word| (word.id, word)).collect();
     let pool = get_db(&app)?;
     let conn = pool.get().map_err(|e| e.to_string())?;
@@ -415,7 +430,9 @@ fn get_study_queue(
                  WHERE level = ?1
                    AND status != 'new'
                    AND (next_review IS NULL OR next_review <= datetime('now') OR status = 'hard')
-                 ORDER BY wrong_count DESC, next_review ASC, last_seen ASC
+                 ORDER BY COALESCE(next_review, '1970-01-01 00:00:00') ASC,
+                          wrong_count DESC,
+                          last_seen ASC
                  LIMIT ?2",
             )
             .map_err(|e| e.to_string())?;

@@ -22,7 +22,7 @@
         <p class="text-sm font-medium text-emerald-600">今日学习完成</p>
         <h3 class="mt-1 text-2xl font-bold text-slate-900">完成 {{ queueItems.length }} 张词卡</h3>
       </div>
-      <div class="mb-6 grid gap-3 sm:grid-cols-4">
+      <div class="mb-6 grid gap-3 sm:grid-cols-5">
         <div class="rounded-xl bg-slate-50 p-4">
           <p class="text-sm text-slate-500">新词</p>
           <p class="mt-1 text-2xl font-bold text-slate-900">{{ sessionStats.newWords }}</p>
@@ -38,6 +38,10 @@
         <div class="rounded-xl bg-slate-50 p-4">
           <p class="text-sm text-slate-500">不记得</p>
           <p class="mt-1 text-2xl font-bold text-red-600">{{ sessionStats.forgotten }}</p>
+        </div>
+        <div class="rounded-xl bg-slate-50 p-4">
+          <p class="text-sm text-slate-500">正确率</p>
+          <p class="mt-1 text-2xl font-bold text-blue-600">{{ accuracyPercent }}%</p>
         </div>
       </div>
       <div class="rounded-xl bg-blue-50 p-4 text-sm leading-6 text-slate-700">
@@ -85,7 +89,7 @@
             <span class="rounded-full px-3 py-1 text-xs font-semibold" :class="lastRemembered ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-600'">
               {{ lastRemembered ? '已标记记得' : '已加入复习' }}
             </span>
-            <span class="text-sm text-slate-400">即将自动进入下一个单词</span>
+            <span class="text-sm text-slate-400">{{ detailStatusText }}</span>
           </div>
 
           <div class="mb-6 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
@@ -97,7 +101,7 @@
               </div>
             </div>
             <button class="rounded-xl bg-slate-100 px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-200" @click="goNextNow">
-              立即下一个
+              {{ cardAdvanceMode === 'manual' ? '继续' : '立即下一个' }}
             </button>
           </div>
 
@@ -134,6 +138,8 @@ const appConfig = ref(null)
 const currentLevel = ref('junior')
 const plannedNewWords = ref(20)
 const plannedReviewWords = ref(30)
+const cardAdvanceMode = ref('auto')
+const cardDetailSeconds = ref(2)
 const queueItems = ref([])
 const currentIndex = ref(0)
 const loading = ref(false)
@@ -156,6 +162,15 @@ const levelName = computed(() => levelOptions.find(level => level.key === curren
 const currentIndexLabel = computed(() => {
   if (queueItems.value.length === 0) return '0 / 0'
   return `${Math.min(currentIndex.value + 1, queueItems.value.length)} / ${queueItems.value.length}`
+})
+const accuracyPercent = computed(() => {
+  const total = sessionStats.remembered + sessionStats.forgotten
+  if (!total) return 0
+  return Math.round((sessionStats.remembered / total) * 100)
+})
+const detailStatusText = computed(() => {
+  if (cardAdvanceMode.value === 'manual') return '详情已展开，点击继续进入下一个单词'
+  return `${cardDetailSeconds.value} 秒后自动进入下一个单词`
 })
 const progressPercent = computed(() => {
   if (queueItems.value.length === 0) return 0
@@ -199,6 +214,8 @@ async function loadStudyQueue() {
     currentLevel.value = config.active_level || 'junior'
     plannedNewWords.value = config.daily_new_words ?? 20
     plannedReviewWords.value = config.daily_review_words ?? 30
+    cardAdvanceMode.value = config.card_advance_mode || 'auto'
+    cardDetailSeconds.value = Math.min(10, Math.max(1, Number(config.card_detail_seconds) || 2))
 
     queueItems.value = await invoke('get_study_queue', {
       level: currentLevel.value,
@@ -236,7 +253,9 @@ async function answerMemory(remembered) {
     console.warn('保存学习结果失败:', e)
   }
 
-  advanceTimer = window.setTimeout(goNextNow, 1800)
+  if (cardAdvanceMode.value === 'auto') {
+    advanceTimer = window.setTimeout(goNextNow, cardDetailSeconds.value * 1000)
+  }
 }
 
 function goNextNow() {
@@ -274,7 +293,7 @@ async function saveSessionProgress() {
 }
 
 async function generateNextPlan() {
-  const fallback = `明天建议学习 ${plannedNewWords.value} 个新词，复习 ${plannedReviewWords.value} 个单词。优先复习今天标记“不记得”的单词。`
+  const fallback = `明天建议学习 ${plannedNewWords.value} 个新词，复习 ${plannedReviewWords.value} 个单词。\n安排理由：今天不记得 ${sessionStats.forgotten} 个，优先复习薄弱词可以稳住记忆曲线。`
   const config = appConfig.value
   if (!config?.model?.api_key) {
     nextPlan.value = fallback
@@ -293,7 +312,7 @@ async function generateNextPlan() {
         },
         {
           role: 'user',
-          content: `今天学段：${levelName.value}。新词 ${sessionStats.newWords} 个，复习 ${sessionStats.reviewWords} 个，记得 ${sessionStats.remembered} 个，不记得 ${sessionStats.forgotten} 个。请生成 ${tomorrow} 的学习计划，包含新词数量、复习数量和一个重点提醒，100 字以内。`,
+          content: `今天学段：${levelName.value}。新词 ${sessionStats.newWords} 个，复习 ${sessionStats.reviewWords} 个，记得 ${sessionStats.remembered} 个，不记得 ${sessionStats.forgotten} 个，正确率 ${accuracyPercent.value}%。请生成 ${tomorrow} 的学习计划，包含新词数量、复习数量、一个重点提醒，以及“为什么这样安排”的简短理由，140 字以内。`,
         },
       ],
     })
