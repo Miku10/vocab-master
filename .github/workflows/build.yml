@@ -18,10 +18,11 @@ jobs:
           node-version: '22'
 
       - name: Install root deps (@tauri-apps/cli)
-        run: npm ci
+        run: npm install
+        working-directory: .
 
       - name: Install frontend deps
-        run: npm ci
+        run: npm install
         working-directory: frontend
 
       - name: Install Rust stable
