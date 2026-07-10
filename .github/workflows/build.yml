@@ -11,23 +11,44 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '22'
+
+      # 修复：改用 npm install 替代 npm ci，自动同步 lock 文件
+      - name: Install frontend deps
+        run: npm install
+        working-directory: frontend
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-      - name: Install dependencies (frontend)
-        run: npm ci
-        working-directory: frontend
-      - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
         with:
-          projectPath: frontend
-          args: --bundler nsis
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build NSIS installer
+        run: npm run tauri:build
+        working-directory: frontend
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: VocabMaster-Setup
-          path: frontend/src-tauri/target/release/bundle/nsis/*.exe
+          path: src-tauri/target/release/bundle/nsis/*.exe
           retention-days: 30
+
+      # 可选：清理构建环境（实际上 runner 结束后会自动销毁，此步可省略）
+      - name: Cleanup build environment
+        run: |
+          Remove-Item -Recurse -Force "$env:USERPROFILE\.cargo\registry" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "$env:USERPROFILE\.cargo\git" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "src-tauri\target" -ErrorAction SilentlyContinue
+          echo "Build environment cleaned up."
