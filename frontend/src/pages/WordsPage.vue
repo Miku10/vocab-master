@@ -314,6 +314,8 @@ async function loadStudyQueue(options = {}) {
       dailyPlanAlreadyComplete.value = true
       sessionComplete.value = true
       queueItems.value = []
+      await loadCompletedSessionStats()
+      if (version !== viewVersion) return
       nextPlan.value = await readCachedNextPlan()
       return
     }
@@ -416,11 +418,32 @@ async function saveSessionProgress() {
         correct_count: sessionStats.remembered,
         incorrect_count: sessionStats.forgotten,
         duration_seconds: sessionDurationSeconds(),
+        level: currentLevel.value,
       },
     })
   } catch (e) {
     console.warn('保存会话进度失败:', e)
   }
+}
+
+async function loadCompletedSessionStats() {
+  try {
+    const summary = await invoke('get_daily_study_summary', {
+      level: currentLevel.value,
+      date: dateKey(0),
+    })
+    applySessionSummary(summary)
+  } catch (e) {
+    console.warn('读取今日学习统计失败:', e)
+  }
+}
+
+function applySessionSummary(summary) {
+  sessionStats.newWords = Number(summary?.new_words || 0)
+  sessionStats.reviewWords = Number(summary?.reviewed_words || 0)
+  sessionStats.remembered = Number(summary?.correct_count || 0)
+  sessionStats.fuzzy = Number(summary?.fuzzy_count || 0)
+  sessionStats.forgotten = Number(summary?.incorrect_count || 0)
 }
 
 async function generateNextPlan({ allowUpdateExisting = false, version = viewVersion } = {}) {

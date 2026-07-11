@@ -360,6 +360,7 @@ fn init_tables(pool: &DbPool) -> Result<(), String> {
         CREATE TABLE IF NOT EXISTS study_sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             date TEXT NOT NULL,
+            level TEXT DEFAULT '',
             new_words INTEGER DEFAULT 0,
             reviewed_words INTEGER DEFAULT 0,
             fuzzy_count INTEGER DEFAULT 0,
@@ -398,6 +399,14 @@ fn init_tables(pool: &DbPool) -> Result<(), String> {
     );
     let _ = conn.execute(
         "ALTER TABLE study_sessions ADD COLUMN fuzzy_count INTEGER DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE study_sessions ADD COLUMN level TEXT DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ss_date_level ON study_sessions(date, level)",
         [],
     );
     Ok(())
@@ -1173,12 +1182,22 @@ fn save_progress(app: tauri::AppHandle, data: Value) -> Result<(), String> {
     let conn = pool.get().map_err(|e| e.to_string())?;
     let today = local_date();
     let created_at = local_now_iso();
+    let level = data
+        .get("level")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !level.is_empty() {
+        validate_level(&level)?;
+    }
 
     conn.execute(
-        "INSERT INTO study_sessions (date, new_words, reviewed_words, fuzzy_count, correct_count, incorrect_count, duration_seconds, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO study_sessions (date, level, new_words, reviewed_words, fuzzy_count, correct_count, incorrect_count, duration_seconds, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             today,
+            level,
             data.get("new_words").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             data.get("reviewed_words").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             data.get("fuzzy_count").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
@@ -1200,6 +1219,45 @@ fn save_progress(app: tauri::AppHandle, data: Value) -> Result<(), String> {
     let json_str = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
     fs::write(path, json_str).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+fn get_daily_study_summary(
+    app: tauri::AppHandle,
+    level: String,
+    date: String,
+) -> Result<Value, String> {
+    validate_level(&level)?;
+    let pool = get_db(&app)?;
+    let conn = pool.get().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT
+                COALESCE(SUM(new_words), 0),
+                COALESCE(SUM(reviewed_words), 0),
+                COALESCE(SUM(fuzzy_count), 0),
+                COALESCE(SUM(correct_count), 0),
+                COALESCE(SUM(incorrect_count), 0),
+                COALESCE(SUM(duration_seconds), 0)
+             FROM study_sessions
+             WHERE date = ?1 AND (level = ?2 OR COALESCE(level, '') = '')",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let summary = stmt
+        .query_row(params![date, level], |row| {
+            Ok(json!({
+                "new_words": row.get::<_, i32>(0)?,
+                "reviewed_words": row.get::<_, i32>(1)?,
+                "fuzzy_count": row.get::<_, i32>(2)?,
+                "correct_count": row.get::<_, i32>(3)?,
+                "incorrect_count": row.get::<_, i32>(4)?,
+                "duration_seconds": row.get::<_, i32>(5)?,
+            }))
+        })
+        .map_err(|e| e.to_string())?;
+
+    Ok(summary)
 }
 
 /// 保存完整测验记录
@@ -2382,6 +2440,7 @@ pub fn run() {
             mark_word_hard,
             get_dashboard_data,
             save_progress,
+            get_daily_study_summary,
             save_quiz_record,
             get_quiz_records,
             get_wrong_book,
