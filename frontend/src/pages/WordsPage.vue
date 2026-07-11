@@ -187,6 +187,7 @@ let sessionStartedAt = 0
 let hasMounted = false
 let viewVersion = 0
 let audioRequestId = 0
+let audioPlaybackId = 0
 let activeAudio = null
 
 const sessionStats = reactive({
@@ -647,33 +648,43 @@ async function fetchPronunciation() {
 }
 
 async function playPronunciation() {
+  const requestedWord = currentWord.value.word
   if (!audioUrl.value) {
     await fetchPronunciation()
   }
+  if (currentWord.value.word !== requestedWord) return
   if (!audioUrl.value) return
 
   await playAudioSource(audioUrl.value)
 }
 
 async function autoPlayCurrentWordAudio() {
-  if (!currentWord.value.word || showDetail.value || sessionComplete.value) return
+  const requestedWord = currentWord.value.word
+  if (!requestedWord || showDetail.value || sessionComplete.value) return
   await fetchPronunciation()
+  if (currentWord.value.word !== requestedWord) return
   if (!audioUrl.value || showDetail.value || sessionComplete.value) return
   await playAudioSource(audioUrl.value)
 }
 
 async function playAudioSource(source) {
+  const playbackId = ++audioPlaybackId
+  const playbackWord = currentWord.value.word
   try {
     stopActiveAudio()
-    activeAudio = new Audio(source)
-    await activeAudio.play()
+    const audio = new Audio(source)
+    activeAudio = audio
+    await audio.play()
   } catch (e) {
-    audioError.value = `播放失败：${e}`
+    if (playbackId !== audioPlaybackId || currentWord.value.word !== playbackWord) return
+    if (isInterruptedAudioPlay(e)) return
+    audioError.value = `播放失败：${formatAudioError(e)}`
   }
 }
 
 function resetAudioState() {
   audioRequestId++
+  audioPlaybackId++
   stopActiveAudio()
   audioUrl.value = ''
   audioLoading.value = false
@@ -682,9 +693,20 @@ function resetAudioState() {
 
 function stopActiveAudio() {
   if (!activeAudio) return
-  activeAudio.pause()
-  activeAudio.src = ''
+  const audio = activeAudio
   activeAudio = null
+  audio.pause()
+  audio.src = ''
+}
+
+function isInterruptedAudioPlay(error) {
+  const name = String(error?.name || '')
+  const message = formatAudioError(error)
+  return name === 'AbortError' || message.includes('The play() request was interrupted')
+}
+
+function formatAudioError(error) {
+  return String(error?.message || error || '未知错误')
 }
 
 function normalizeAudioSource(source) {
