@@ -84,9 +84,15 @@ function openSettings() {
   showSettings.value = true
 }
 
-function closeSettings() {
+async function closeSettings() {
   needsSetup.value = false
   showSettings.value = false
+  try {
+    const config = await invoke('get_config')
+    triggerWordBankEnrichment(config)
+  } catch (e) {
+    console.warn('读取保存后的配置失败:', e)
+  }
 }
 
 onMounted(async () => {
@@ -95,10 +101,24 @@ onMounted(async () => {
     if (!config.setup_complete) {
       needsSetup.value = true
       showSettings.value = true
+    } else {
+      triggerWordBankEnrichment(config)
     }
   } catch (e) {
     console.warn('读取配置失败:', e)
   }
   appLoading.value = false
 })
+
+function triggerWordBankEnrichment(config) {
+  const key = String(config?.model?.api_key || '').trim()
+  const level = String(config?.active_level || '').trim()
+  if (!key || !level || isPlaceholderApiKey(key)) return
+  invoke('auto_enrich_word_bank_examples', { config, level })
+    .catch(e => console.warn('后台补充词库例句失败:', e))
+}
+
+function isPlaceholderApiKey(key) {
+  return ['api_key', 'your_api_key', 'your-api-key', 'sk-xxx', 'sk-xxxx'].includes(key.toLowerCase())
+}
 </script>

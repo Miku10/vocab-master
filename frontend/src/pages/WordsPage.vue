@@ -22,7 +22,7 @@
         <p class="text-sm font-medium text-emerald-600">今日学习完成</p>
         <h3 class="mt-1 text-2xl font-bold text-slate-900">完成 {{ queueItems.length }} 张词卡</h3>
       </div>
-      <div class="mb-6 grid gap-3 sm:grid-cols-5">
+      <div class="mb-6 grid gap-3 sm:grid-cols-6">
         <div class="rounded-xl bg-slate-50 p-4">
           <p class="text-sm text-slate-500">新词</p>
           <p class="mt-1 text-2xl font-bold text-slate-900">{{ sessionStats.newWords }}</p>
@@ -34,6 +34,10 @@
         <div class="rounded-xl bg-slate-50 p-4">
           <p class="text-sm text-slate-500">记得</p>
           <p class="mt-1 text-2xl font-bold text-emerald-600">{{ sessionStats.remembered }}</p>
+        </div>
+        <div class="rounded-xl bg-slate-50 p-4">
+          <p class="text-sm text-slate-500">模糊</p>
+          <p class="mt-1 text-2xl font-bold text-amber-600">{{ sessionStats.fuzzy }}</p>
         </div>
         <div class="rounded-xl bg-slate-50 p-4">
           <p class="text-sm text-slate-500">不记得</p>
@@ -77,22 +81,26 @@
         </div>
         <p class="mb-3 text-sm text-slate-400">看到这个单词时，你能想起意思吗？</p>
         <h3 class="break-words text-5xl font-bold tracking-normal text-slate-900 sm:text-6xl">{{ currentWord.word }}</h3>
-        <div class="mt-8 grid gap-3 sm:grid-cols-2">
-          <button class="rounded-2xl bg-red-50 px-5 py-4 text-base font-bold text-red-600 hover:bg-red-100" @click="answerMemory(false)">
+        <p class="mt-4 text-sm" :class="audioError ? 'text-red-600' : 'text-slate-500'">{{ audioStatusText }}</p>
+        <div class="mt-8 grid gap-3 sm:grid-cols-3">
+          <button class="rounded-2xl bg-red-50 px-5 py-4 text-base font-bold text-red-600 hover:bg-red-100" @click="answerMemory('forgotten')">
             不记得
           </button>
-          <button class="rounded-2xl bg-emerald-50 px-5 py-4 text-base font-bold text-emerald-700 hover:bg-emerald-100" @click="answerMemory(true)">
+          <button class="rounded-2xl bg-amber-50 px-5 py-4 text-base font-bold text-amber-700 hover:bg-amber-100" @click="answerMemory('fuzzy')">
+            模糊
+          </button>
+          <button class="rounded-2xl bg-emerald-50 px-5 py-4 text-base font-bold text-emerald-700 hover:bg-emerald-100" @click="answerMemory('remembered')">
             记得
           </button>
         </div>
       </div>
 
       <div v-else class="overflow-hidden rounded-2xl bg-white shadow-sm ring-1 ring-slate-100">
-        <div class="h-2" :class="lastRemembered ? 'bg-emerald-500' : 'bg-red-500'"></div>
+        <div class="h-2" :class="memoryStateMeta.barClass"></div>
         <div class="p-6 sm:p-8">
           <div class="mb-5 flex flex-wrap items-center gap-3">
-            <span class="rounded-full px-3 py-1 text-xs font-semibold" :class="lastRemembered ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-600'">
-              {{ lastRemembered ? '已标记记得' : '已加入复习' }}
+            <span class="rounded-full px-3 py-1 text-xs font-semibold" :class="memoryStateMeta.badgeClass">
+              {{ memoryStateMeta.label }}
             </span>
             <span class="text-sm text-slate-400">{{ detailStatusText }}</span>
           </div>
@@ -133,6 +141,7 @@
           <div v-if="currentWord.example" class="rounded-xl border border-amber-100 bg-amber-50 p-4">
             <p class="text-sm font-semibold text-amber-800">例句</p>
             <p class="mt-2 text-sm leading-6 text-slate-700">{{ currentWord.example }}</p>
+            <p v-if="currentWord.example_translation" class="mt-2 text-sm leading-6 text-slate-600">{{ currentWord.example_translation }}</p>
           </div>
         </div>
       </div>
@@ -163,7 +172,7 @@ const queueItems = ref([])
 const currentIndex = ref(0)
 const loading = ref(false)
 const showDetail = ref(false)
-const lastRemembered = ref(false)
+const lastMemoryState = ref('remembered')
 const sessionComplete = ref(false)
 const nextPlan = ref('')
 const extraStudyMode = ref(false)
@@ -173,11 +182,15 @@ const audioError = ref('')
 let advanceTimer = null
 let sessionStartedAt = 0
 let hasMounted = false
+let viewVersion = 0
+let audioRequestId = 0
+let activeAudio = null
 
 const sessionStats = reactive({
   newWords: 0,
   reviewWords: 0,
   remembered: 0,
+  fuzzy: 0,
   forgotten: 0,
 })
 
@@ -189,9 +202,30 @@ const currentIndexLabel = computed(() => {
   return `${Math.min(currentIndex.value + 1, queueItems.value.length)} / ${queueItems.value.length}`
 })
 const accuracyPercent = computed(() => {
-  const total = sessionStats.remembered + sessionStats.forgotten
+  const total = sessionStats.remembered + sessionStats.fuzzy + sessionStats.forgotten
   if (!total) return 0
   return Math.round((sessionStats.remembered / total) * 100)
+})
+const memoryStateMeta = computed(() => {
+  if (lastMemoryState.value === 'fuzzy') {
+    return {
+      label: '已标记模糊',
+      barClass: 'bg-amber-500',
+      badgeClass: 'bg-amber-100 text-amber-700',
+    }
+  }
+  if (lastMemoryState.value === 'forgotten') {
+    return {
+      label: '已加入重点复习',
+      barClass: 'bg-red-500',
+      badgeClass: 'bg-red-100 text-red-600',
+    }
+  }
+  return {
+    label: '已标记认识',
+    barClass: 'bg-emerald-500',
+    badgeClass: 'bg-emerald-100 text-emerald-700',
+  }
 })
 const detailStatusText = computed(() => {
   if (cardAdvanceMode.value === 'manual') return '详情已展开，点击继续进入下一个单词'
@@ -240,21 +274,16 @@ onActivated(() => {
 })
 
 onBeforeRouteLeave(() => {
-  clearAdvanceTimer()
-  sessionComplete.value = false
-  showDetail.value = false
-  nextPlan.value = ''
-  queueItems.value = []
-  currentIndex.value = 0
-  resetStats()
-  resetAudioState()
+  resetStudyView()
 })
 
 onBeforeUnmount(() => {
+  viewVersion++
   clearAdvanceTimer()
 })
 
 async function loadStudyQueue(options = {}) {
+  const version = ++viewVersion
   clearAdvanceTimer()
   extraStudyMode.value = Boolean(options.extra)
   loading.value = true
@@ -268,6 +297,7 @@ async function loadStudyQueue(options = {}) {
 
   try {
     const config = await invoke('get_config')
+    if (version !== viewVersion) return
     appConfig.value = config
     currentLevel.value = config.active_level || 'junior'
     plannedNewWords.value = config.daily_new_words ?? 20
@@ -275,31 +305,44 @@ async function loadStudyQueue(options = {}) {
     cardAdvanceMode.value = config.card_advance_mode || 'auto'
     cardDetailSeconds.value = Math.min(10, Math.max(1, Number(config.card_detail_seconds) || 2))
 
-    queueItems.value = await invoke('get_study_queue', {
+    const queue = await invoke('get_study_queue', {
       level: currentLevel.value,
       newCount: plannedNewWords.value,
       reviewCount: plannedReviewWords.value,
     })
+    if (version !== viewVersion) return
+    queueItems.value = queue
+    if (queueItems.value.length > 0) {
+      autoPlayCurrentWordAudio()
+    }
   } catch (e) {
     console.error('加载学习队列失败:', e)
-    queueItems.value = []
+    if (version === viewVersion) {
+      queueItems.value = []
+    }
   } finally {
-    loading.value = false
+    if (version === viewVersion) {
+      loading.value = false
+    }
   }
 }
 
-async function answerMemory(remembered) {
+async function answerMemory(state) {
   if (showDetail.value || !currentWord.value.word) return
   clearAdvanceTimer()
-  resetAudioState()
-  lastRemembered.value = remembered
+  lastMemoryState.value = state
   showDetail.value = true
-  fetchPronunciation()
+  if (!audioUrl.value && !audioLoading.value) {
+    fetchPronunciation()
+  }
 
   try {
-    if (remembered) {
+    if (state === 'remembered') {
       await invoke('mark_word_learned', { word: currentWord.value })
       sessionStats.remembered++
+    } else if (state === 'fuzzy') {
+      await invoke('mark_word_fuzzy', { word: currentWord.value })
+      sessionStats.fuzzy++
     } else {
       await invoke('mark_word_hard', { word: currentWord.value })
       sessionStats.forgotten++
@@ -324,19 +367,27 @@ function goNextNow() {
     currentIndex.value++
     showDetail.value = false
     resetAudioState()
-    lastRemembered.value = false
+    lastMemoryState.value = 'remembered'
+    window.setTimeout(autoPlayCurrentWordAudio, 0)
     return
   }
   completeSession()
 }
 
 async function completeSession() {
+  const version = viewVersion
   sessionComplete.value = true
   showDetail.value = false
   resetAudioState()
   currentIndex.value = queueItems.value.length
   await saveSessionProgress()
-  await generateNextPlan({ force: extraStudyMode.value })
+  if (!extraStudyMode.value) {
+    await markDailyPlanComplete()
+  }
+  await generateNextPlan({
+    allowUpdateExisting: extraStudyMode.value,
+    version,
+  })
 }
 
 async function saveSessionProgress() {
@@ -345,6 +396,7 @@ async function saveSessionProgress() {
       data: {
         new_words: sessionStats.newWords,
         reviewed_words: sessionStats.reviewWords,
+        fuzzy_count: sessionStats.fuzzy,
         correct_count: sessionStats.remembered,
         incorrect_count: sessionStats.forgotten,
         duration_seconds: sessionDurationSeconds(),
@@ -355,20 +407,33 @@ async function saveSessionProgress() {
   }
 }
 
-async function generateNextPlan({ force = false } = {}) {
-  if (!force) {
-    const cached = readCachedNextPlan()
-    if (cached) {
+async function generateNextPlan({ allowUpdateExisting = false, version = viewVersion } = {}) {
+  const cached = await readCachedNextPlan()
+  if (cached && !allowUpdateExisting) {
+    if (version === viewVersion) {
       nextPlan.value = cached
-      return
     }
+    return
   }
 
-  const fallback = `明天建议学习 ${plannedNewWords.value} 个新词，复习 ${plannedReviewWords.value} 个单词。\n安排理由：今天不记得 ${sessionStats.forgotten} 个，优先复习薄弱词可以稳住记忆曲线。`
+  if (version !== viewVersion) {
+    return
+  }
+
+  const forecast = await loadReviewForecast()
+  const reviewTarget = Math.max(
+    plannedReviewWords.value,
+    Number(forecast.due_tomorrow || 0),
+    sessionStats.fuzzy,
+    sessionStats.forgotten,
+  )
+  const fallback = `明天建议学习 ${plannedNewWords.value} 个新词，复习 ${reviewTarget} 个单词。\n安排理由：按 1/3/7/15/30/60 天记忆曲线，明天预计到期 ${forecast.due_tomorrow || 0} 个，其中模糊词 ${forecast.fuzzy_words || 0} 个、困难词 ${forecast.hard_words || 0} 个。`
   const config = appConfig.value
-  if (!config?.model?.api_key) {
-    nextPlan.value = fallback
-    saveNextPlan(fallback)
+  if (!hasModelApiKey(config)) {
+    if (version === viewVersion) {
+      nextPlan.value = fallback
+      await saveNextPlan(fallback)
+    }
     return
   }
 
@@ -383,34 +448,54 @@ async function generateNextPlan({ force = false } = {}) {
         },
         {
           role: 'user',
-          content: `今天学段：${levelName.value}。新词 ${sessionStats.newWords} 个，复习 ${sessionStats.reviewWords} 个，记得 ${sessionStats.remembered} 个，不记得 ${sessionStats.forgotten} 个，正确率 ${accuracyPercent.value}%。请生成 ${tomorrow} 的学习计划，包含新词数量、复习数量、一个重点提醒，以及“为什么这样安排”的简短理由，140 字以内。`,
+          content: `今天学段：${levelName.value}。新词 ${sessionStats.newWords} 个，复习 ${sessionStats.reviewWords} 个，认识 ${sessionStats.remembered} 个，模糊 ${sessionStats.fuzzy} 个，不认识 ${sessionStats.forgotten} 个，掌握率 ${accuracyPercent.value}%。记忆曲线预测：当前到期 ${forecast.due_now || 0} 个，明天到期 ${forecast.due_tomorrow || 0} 个，模糊词 ${forecast.fuzzy_words || 0} 个，困难词 ${forecast.hard_words || 0} 个。请生成 ${tomorrow} 的学习计划，包含新词数量、复习数量、一个重点提醒，以及“为什么这样安排”的简短理由，140 字以内。`,
         },
       ],
     })
-    nextPlan.value = content
-    saveNextPlan(content)
+    if (version === viewVersion) {
+      nextPlan.value = content
+      await saveNextPlan(content)
+    }
   } catch (e) {
     console.warn('生成明日计划失败:', e)
-    nextPlan.value = fallback
-    saveNextPlan(fallback)
+    if (version === viewVersion) {
+      nextPlan.value = fallback
+      await saveNextPlan(fallback)
+    }
   }
 }
 
-function saveNextPlan(content) {
-  localStorage.setItem('vocab-master-next-plan', JSON.stringify({
-    createdAt: new Date().toISOString(),
+function hasModelApiKey(config) {
+  const key = String(config?.model?.api_key || '').trim()
+  return Boolean(key && !isPlaceholderApiKey(key))
+}
+
+function isPlaceholderApiKey(key) {
+  return ['api_key', 'your_api_key', 'your-api-key', 'sk-xxx', 'sk-xxxx'].includes(key.toLowerCase())
+}
+
+async function saveNextPlan(content) {
+  await invoke('save_next_plan', { record: {
+    createdAt: localDateTimeString(),
     createdForDate: dateKey(0),
     planDate: dateKey(1),
     level: currentLevel.value,
     content,
-  }))
+  } })
 }
 
-function readCachedNextPlan() {
+async function loadReviewForecast() {
   try {
-    const raw = localStorage.getItem('vocab-master-next-plan')
-    if (!raw) return ''
-    const cached = JSON.parse(raw)
+    return await invoke('get_review_forecast', { level: currentLevel.value })
+  } catch (e) {
+    console.warn('读取记忆曲线预测失败:', e)
+    return { due_now: 0, due_tomorrow: plannedReviewWords.value, fuzzy_words: sessionStats.fuzzy, hard_words: sessionStats.forgotten }
+  }
+}
+
+async function readCachedNextPlan() {
+  try {
+    const cached = await invoke('get_next_plan')
     if (cached?.planDate === dateKey(1) && cached?.level === currentLevel.value && cached?.content) {
       return cached.content
     }
@@ -418,6 +503,17 @@ function readCachedNextPlan() {
     return ''
   }
   return ''
+}
+
+async function markDailyPlanComplete() {
+  try {
+    await invoke('mark_daily_plan_complete', {
+      level: currentLevel.value,
+      date: dateKey(0),
+    })
+  } catch (e) {
+    console.warn('保存今日计划完成状态失败:', e)
+  }
 }
 
 function startExtraStudy() {
@@ -443,7 +539,24 @@ function resetStats() {
   sessionStats.newWords = 0
   sessionStats.reviewWords = 0
   sessionStats.remembered = 0
+  sessionStats.fuzzy = 0
   sessionStats.forgotten = 0
+}
+
+function resetStudyView() {
+  viewVersion++
+  clearAdvanceTimer()
+  loading.value = false
+  sessionComplete.value = false
+  showDetail.value = false
+  nextPlan.value = ''
+  queueItems.value = []
+  currentIndex.value = 0
+  extraStudyMode.value = false
+  lastMemoryState.value = 'remembered'
+  sessionStartedAt = 0
+  resetStats()
+  resetAudioState()
 }
 
 function clearAdvanceTimer() {
@@ -455,6 +568,7 @@ function clearAdvanceTimer() {
 
 async function fetchPronunciation() {
   if (!currentWord.value.word) return
+  const requestId = ++audioRequestId
   const requestedWord = currentWord.value.word
   audioLoading.value = true
   audioError.value = ''
@@ -462,15 +576,15 @@ async function fetchPronunciation() {
 
   try {
     const url = await invoke('play_word_audio', { word: requestedWord })
-    if (currentWord.value.word === requestedWord) {
+    if (requestId === audioRequestId && currentWord.value.word === requestedWord) {
       audioUrl.value = normalizeAudioSource(url)
     }
   } catch (e) {
-    if (currentWord.value.word === requestedWord) {
+    if (requestId === audioRequestId && currentWord.value.word === requestedWord) {
       audioError.value = `发音获取失败：${e}`
     }
   } finally {
-    if (currentWord.value.word === requestedWord) {
+    if (requestId === audioRequestId && currentWord.value.word === requestedWord) {
       audioLoading.value = false
     }
   }
@@ -482,18 +596,39 @@ async function playPronunciation() {
   }
   if (!audioUrl.value) return
 
+  await playAudioSource(audioUrl.value)
+}
+
+async function autoPlayCurrentWordAudio() {
+  if (!currentWord.value.word || showDetail.value || sessionComplete.value) return
+  await fetchPronunciation()
+  if (!audioUrl.value || showDetail.value || sessionComplete.value) return
+  await playAudioSource(audioUrl.value)
+}
+
+async function playAudioSource(source) {
   try {
-    const audio = new Audio(audioUrl.value)
-    await audio.play()
+    stopActiveAudio()
+    activeAudio = new Audio(source)
+    await activeAudio.play()
   } catch (e) {
     audioError.value = `播放失败：${e}`
   }
 }
 
 function resetAudioState() {
+  audioRequestId++
+  stopActiveAudio()
   audioUrl.value = ''
   audioLoading.value = false
   audioError.value = ''
+}
+
+function stopActiveAudio() {
+  if (!activeAudio) return
+  activeAudio.pause()
+  activeAudio.src = ''
+  activeAudio = null
 }
 
 function normalizeAudioSource(source) {
@@ -502,5 +637,11 @@ function normalizeAudioSource(source) {
     return value
   }
   return convertFileSrc(value)
+}
+
+function localDateTimeString() {
+  const date = new Date()
+  const pad = value => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 </script>

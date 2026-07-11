@@ -3,6 +3,37 @@
     <div v-if="loading" class="rounded-2xl bg-white py-12 text-center text-slate-500 shadow-sm ring-1 ring-slate-100">
       正在加载仪表盘...
     </div>
+
+    <section class="grid gap-4 lg:grid-cols-[1.4fr_1fr]">
+      <div class="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-100">
+        <p class="text-sm font-semibold text-blue-600">{{ activeLevelLabel }} · 今日学习工作台</p>
+        <h2 class="mt-2 text-2xl font-bold text-slate-900">先完成词卡，再进入测验</h2>
+        <div class="mt-5 grid gap-3 sm:grid-cols-3">
+          <div class="rounded-xl bg-blue-50 p-4">
+            <p class="text-sm text-blue-700">当前到期</p>
+            <p class="mt-1 text-2xl font-bold text-blue-900">{{ reviewForecast.due_now }}</p>
+          </div>
+          <div class="rounded-xl bg-amber-50 p-4">
+            <p class="text-sm text-amber-700">模糊词</p>
+            <p class="mt-1 text-2xl font-bold text-amber-900">{{ reviewForecast.fuzzy_words }}</p>
+          </div>
+          <div class="rounded-xl bg-red-50 p-4">
+            <p class="text-sm text-red-700">困难词</p>
+            <p class="mt-1 text-2xl font-bold text-red-900">{{ reviewForecast.hard_words }}</p>
+          </div>
+        </div>
+        <div class="mt-5 flex flex-col gap-3 sm:flex-row">
+          <router-link to="/words" class="rounded-xl bg-blue-600 px-5 py-3 text-center text-sm font-semibold text-white hover:bg-blue-700">开始今日词卡</router-link>
+          <router-link to="/quiz" class="rounded-xl bg-slate-100 px-5 py-3 text-center text-sm font-semibold text-slate-700 hover:bg-slate-200">完成后去测验</router-link>
+        </div>
+      </div>
+
+      <div class="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-100">
+        <p class="text-sm font-semibold text-slate-500">明日计划摘要</p>
+        <p class="mt-3 whitespace-pre-line text-sm leading-6 text-slate-700">{{ nextPlanSummary || '完成今日学习后会生成明日计划。' }}</p>
+      </div>
+    </section>
+
     <!-- 统计卡片 -->
     <div class="grid grid-cols-2 gap-4 lg:grid-cols-6">
       <div v-for="stat in stats" :key="stat.label"
@@ -50,6 +81,14 @@ const progressChart = ref(null)
 const trendChart = ref(null)
 const wrongChart = ref(null)
 const loading = ref(true)
+const activeLevelLabel = ref('当前学段')
+const nextPlanSummary = ref('')
+const reviewForecast = reactive({
+  due_now: 0,
+  due_tomorrow: 0,
+  fuzzy_words: 0,
+  hard_words: 0,
+})
 
 const stats = reactive([
   { label: '词库总量', value: '0', icon: '📚', iconBg: 'bg-slate-50' },
@@ -124,7 +163,13 @@ function initCharts() {
 async function loadData() {
   loading.value = true
   try {
-    const data = await invoke('get_dashboard_data')
+    const [data, config] = await Promise.all([
+      invoke('get_dashboard_data'),
+      invoke('get_config'),
+    ])
+    activeLevelLabel.value = levelLabel(config.active_level || data.active_level)
+    await loadReviewForecast(config.active_level || data.active_level)
+    await loadNextPlan(config.active_level || data.active_level)
     stats[0].value = data.total_words
     stats[1].value = data.total_learned
     stats[2].value = data.unlearned_words
@@ -166,5 +211,40 @@ async function loadData() {
     console.error('加载仪表盘数据失败:', e)
   }
   loading.value = false
+}
+
+async function loadReviewForecast(level) {
+  try {
+    const forecast = await invoke('get_review_forecast', { level })
+    reviewForecast.due_now = Number(forecast.due_now || 0)
+    reviewForecast.due_tomorrow = Number(forecast.due_tomorrow || 0)
+    reviewForecast.fuzzy_words = Number(forecast.fuzzy_words || 0)
+    reviewForecast.hard_words = Number(forecast.hard_words || 0)
+  } catch {
+    reviewForecast.due_now = 0
+    reviewForecast.due_tomorrow = 0
+    reviewForecast.fuzzy_words = 0
+    reviewForecast.hard_words = 0
+  }
+}
+
+async function loadNextPlan(level) {
+  try {
+    const plan = await invoke('get_next_plan')
+    nextPlanSummary.value = plan?.level === level ? String(plan.content || '') : ''
+  } catch {
+    nextPlanSummary.value = ''
+  }
+}
+
+function levelLabel(level) {
+  const labels = {
+    primary: '小学',
+    junior: '初中',
+    high: '高中',
+    cet4: '四级',
+    cet6: '六级',
+  }
+  return labels[level] || level || '当前学段'
 }
 </script>

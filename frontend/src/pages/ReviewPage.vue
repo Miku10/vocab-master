@@ -200,7 +200,11 @@ function levelLabel(level) {
 
 function formatDate(value) {
   if (!value) return ''
-  const date = new Date(value)
+  const text = String(value)
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(text)
+    ? `${text.replace(' ', 'T')}Z`
+    : text
+  const date = new Date(normalized)
   if (Number.isNaN(date.getTime())) return String(value)
   return date.toLocaleString('zh-CN', {
     month: '2-digit',

@@ -28,10 +28,22 @@
       <p class="mt-2 text-sm text-slate-500">可以在设置里切换学段或导入词库。</p>
     </div>
 
+    <div v-else-if="!dailyPlanComplete" class="rounded-2xl bg-white py-20 text-center shadow-sm ring-1 ring-slate-100">
+      <div class="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-blue-50 text-lg font-bold text-blue-700">锁</div>
+      <p class="text-lg font-semibold text-slate-800">请先完成今日词卡学习</p>
+      <p class="mt-2 text-sm text-slate-500">当天计划完成后，才会开放基于今日单词的测验。</p>
+    </div>
+
+    <div v-else-if="todayWords.length === 0" class="rounded-2xl bg-white py-20 text-center shadow-sm ring-1 ring-slate-100">
+      <div class="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-slate-50 text-lg font-bold text-slate-600">空</div>
+      <p class="text-lg font-semibold text-slate-800">今日暂无可测单词</p>
+      <p class="mt-2 text-sm text-slate-500">测验只会基于当天完成的词卡单词生成，请先完成今日学习队列。</p>
+    </div>
+
     <div v-else-if="!started" class="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-100 sm:p-8">
       <div class="mb-6">
         <p class="text-sm font-medium text-slate-500">优先用 AI 按考试高频题型生成；未配置模型时使用本地释义默写兜底。</p>
-        <h3 class="mt-1 text-2xl font-bold text-slate-900">准备开始 {{ Math.min(quizSize, words.length) }} 题测试</h3>
+        <h3 class="mt-1 text-2xl font-bold text-slate-900">准备开始 {{ availableQuizCount }} 题测试</h3>
       </div>
       <button class="rounded-xl bg-blue-600 px-5 py-3 text-sm font-semibold text-white hover:bg-blue-700" @click="startQuiz">
         开始测试
@@ -155,6 +167,8 @@ const examTypes = [
 const config = ref(null)
 const level = ref('junior')
 const words = ref([])
+const todayWords = ref([])
+const dailyPlanComplete = ref(false)
 const questions = ref([])
 const answers = ref([])
 const quizSize = ref(10)
@@ -166,33 +180,50 @@ const grading = ref(false)
 const result = ref(null)
 
 const levelName = computed(() => levelOptions.find(item => item.key === level.value)?.label || level.value)
+const availableQuizCount = computed(() => Math.min(quizSize.value, todayWords.value.length))
 
 onMounted(loadWords)
 
 async function loadWords() {
   loading.value = true
   try {
-    const appConfig = await invoke('get_config')
-    config.value = appConfig
-    level.value = appConfig.active_level || 'junior'
-    const data = await invoke('load_words', { level: level.value })
-    words.value = [...data].sort((a, b) => (a.frequency || 999999) - (b.frequency || 999999))
+    await refreshQuizSource()
   } catch (e) {
     console.error('载入测试词库失败:', e)
     words.value = []
+    todayWords.value = []
+    dailyPlanComplete.value = false
   } finally {
     loading.value = false
   }
+}
+
+async function refreshQuizSource() {
+  const appConfig = await invoke('get_config')
+  config.value = appConfig
+  level.value = appConfig.active_level || 'junior'
+  const data = await invoke('load_words', { level: level.value })
+  words.value = [...data].sort((a, b) => (a.frequency || 999999) - (b.frequency || 999999))
+  dailyPlanComplete.value = await isDailyPlanComplete(level.value)
+  todayWords.value = await loadTodayStudyWords(level.value, words.value)
 }
 
 async function startQuiz() {
   result.value = null
   started.value = true
   generating.value = true
-  const seedWords = words.value.slice(0, Math.min(quizSize.value, words.value.length))
+  let seedWords = []
 
   try {
-    questions.value = config.value?.model?.api_key
+    await refreshQuizSource()
+    if (!dailyPlanComplete.value) {
+      started.value = false
+      questions.value = []
+      answers.value = []
+      return
+    }
+    seedWords = selectQuizSeedWords()
+    questions.value = hasModelApiKey()
       ? await generateAiQuestions(seedWords)
       : buildLocalQuestions(seedWords)
   } catch (e) {
@@ -208,7 +239,7 @@ async function submitQuiz() {
   grading.value = true
   const fallback = buildLocalResult()
   try {
-    if (!config.value?.model?.api_key) {
+    if (!hasModelApiKey()) {
       result.value = fallback
       await saveQuizRecord(fallback)
       return
@@ -285,12 +316,95 @@ function buildLocalResult() {
 
   return {
     score,
-    summary: config.value?.model?.api_key
+    summary: hasModelApiKey()
       ? `本地兜底评分：答对 ${correctCount} / ${questions.value.length}。`
       : `未配置模型，已使用本地关键词匹配评分：答对 ${correctCount} / ${questions.value.length}。`,
     advice: score >= 80 ? ['继续增加新词量', '保持每日复习'] : ['降低新词量', '优先复习错词'],
     items,
   }
+}
+
+function hasModelApiKey() {
+  const key = String(config.value?.model?.api_key || '').trim()
+  return Boolean(key && !isPlaceholderApiKey(key))
+}
+
+function isPlaceholderApiKey(key) {
+  return ['api_key', 'your_api_key', 'your-api-key', 'sk-xxx', 'sk-xxxx'].includes(key.toLowerCase())
+}
+
+function selectQuizSeedWords() {
+  return todayWords.value.slice(0, Math.min(quizSize.value, todayWords.value.length))
+}
+
+async function loadTodayStudyWords(levelKey, allWords) {
+  let dbWords = []
+  try {
+    const { startIso, endIso } = localDayRange()
+    const data = await invoke('get_study_words_between', {
+      level: levelKey,
+      startIso,
+      endIso,
+    })
+    dbWords = Array.isArray(data) ? data : []
+  } catch (e) {
+    console.warn('读取今日学习词失败:', e)
+  }
+
+  return mergeWordLists([dbWords], allWords)
+}
+
+function mergeWordLists(lists, allWords) {
+  const byId = new Map(allWords.map(word => [word.id, word]))
+  const byText = new Map(allWords.map(word => [String(word.word || '').toLowerCase(), word]))
+  const seen = new Set()
+  const merged = []
+
+  for (const item of lists.flat()) {
+    const canonical = byId.get(item.id) || byText.get(String(item.word || '').toLowerCase()) || item
+    const key = canonical.id ?? String(canonical.word || '').toLowerCase()
+    if (!canonical.word || seen.has(key)) continue
+    seen.add(key)
+    merged.push(canonical)
+  }
+
+  return merged
+}
+
+function localDayRange() {
+  const start = new Date()
+  start.setHours(0, 0, 0, 0)
+  const end = new Date(start)
+  end.setDate(end.getDate() + 1)
+  return {
+    startIso: localDateTimeString(start),
+    endIso: localDateTimeString(end),
+  }
+}
+
+async function isDailyPlanComplete(levelKey) {
+  try {
+    return await invoke('is_daily_plan_complete', {
+      level: levelKey,
+      date: dateKey(),
+    })
+  } catch (e) {
+    console.warn('读取今日计划完成状态失败:', e)
+    return false
+  }
+}
+
+function dateKey() {
+  const date = new Date()
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+function localDateTimeString(date = new Date()) {
+  const pad = value => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 
 async function generateAiQuestions(seedWords) {
@@ -306,12 +420,13 @@ async function generateAiQuestions(seedWords) {
       {
         role: 'user',
         content: JSON.stringify({
-          instruction: '请基于给定词表生成中国考试常见题型。题目要像中考、高考、四六级常见命题：重视语境、固定搭配、词义辨析、完形填空、阅读词义推断。每题必须有题干、选项、正确答案、解析。',
+          instruction: '请严格围绕 words 列表中的目标词生成中国考试常见题型。每一道题必须考查对应目标词，不要替换成其他词。题目要像中考、高考、四六级常见命题：重视语境、固定搭配、词义辨析、完形填空、阅读词义推断。每题必须有题干、选项、正确答案、解析。',
           search_instruction: searchContext.length
             ? '已提供联网搜索摘要，请优先结合搜索摘要中的真实搭配、例句、考试语境；但不要编造来源链接。'
             : '联网搜索未启用、失败或没有结果，请直接基于本地词库和参考释义生成完整题目。',
           exam_type: selectedType,
-          count: Math.min(quizSize.value, seedWords.length),
+          source: todayWords.value.length ? 'today_study_words' : 'fallback_word_bank',
+          count: seedWords.length,
           search_context: searchContext,
           schema: {
             questions: [
@@ -330,6 +445,7 @@ async function generateAiQuestions(seedWords) {
             word: word.word,
             definition: plainDefinition(word.definition),
             example: word.example,
+            example_translation: word.example_translation || '',
             frequency: word.frequency,
           })),
         }),
@@ -339,9 +455,8 @@ async function generateAiQuestions(seedWords) {
 
   const parsed = extractJson(content)
   const generated = Array.isArray(parsed?.questions) ? parsed.questions : []
-  const normalized = generated
-    .slice(0, seedWords.length)
-    .map((item, index) => normalizeGeneratedQuestion(item, seedWords[index]))
+  const normalized = seedWords
+    .map((word, index) => normalizeGeneratedQuestion(generated[index] || {}, word))
     .filter(Boolean)
 
   return normalized.length ? normalized : buildLocalQuestions(seedWords)
@@ -369,8 +484,7 @@ async function collectSearchContext(seedWords, selectedType) {
 }
 
 function normalizeGeneratedQuestion(item, fallbackWord) {
-  const wordText = String(item?.word || fallbackWord.word)
-  const word = words.value.find(candidate => candidate.word.toLowerCase() === wordText.toLowerCase()) || fallbackWord
+  const word = fallbackWord
   const options = Array.isArray(item?.options) ? item.options.map(String).filter(Boolean) : []
   const answer = String(item?.answer || item?.correct_answer || '')
   const reference = String(item?.reference || plainDefinition(word.definition))
@@ -461,7 +575,7 @@ function buildQuizRecord(finalResult) {
     exam_type: selectedExamType.value,
     exam_type_name: examTypes.find(type => type.key === selectedExamType.value)?.label || selectedExamType.value,
     quiz_size: questions.value.length,
-    created_at: new Date().toISOString(),
+    created_at: localDateTimeString(),
     questions: questions.value.map((question, index) => ({
       index: index + 1,
       word: question.word.word,

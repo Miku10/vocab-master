@@ -1,8 +1,10 @@
+use base64::{engine::general_purpose, Engine as _};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use tauri::Manager;
 
@@ -16,6 +18,8 @@ pub struct Word {
     pub phonetic_us: String,
     pub definition: String,
     pub example: String,
+    #[serde(default)]
+    pub example_translation: String,
     pub level: String,
     pub frequency: i32,
 }
@@ -94,6 +98,12 @@ pub struct WrongWord {
 pub struct StudyQueueItem {
     pub word: Word,
     pub kind: String,
+}
+
+#[derive(Debug, Clone)]
+struct ExamplePatch {
+    example: String,
+    translation: String,
 }
 
 // ==================== 配置管理 ====================
@@ -195,11 +205,124 @@ type DbPool = r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>;
 
 // ==================== SQLite 数据库辅助 ====================
 
+fn install_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn app_data_dir() -> PathBuf {
+    install_dir().join("vocab-master-data")
+}
+
+fn app_data_file(name: &str) -> PathBuf {
+    app_data_dir().join(name)
+}
+
+fn config_path() -> PathBuf {
+    app_data_file("config.toml")
+}
+
+fn progress_path() -> PathBuf {
+    app_data_file("progress.json")
+}
+
+fn next_plan_path() -> PathBuf {
+    app_data_file("next-plan.json")
+}
+
+fn audio_cache_dir() -> PathBuf {
+    app_data_dir().join("audio")
+}
+
+fn logs_dir() -> PathBuf {
+    app_data_dir().join("logs")
+}
+
+fn today_log_path() -> PathBuf {
+    logs_dir().join(format!("app-{}.log", local_date()))
+}
+
+fn word_bank_enrichment_status_path(level: &str) -> Result<PathBuf, String> {
+    validate_level(level)?;
+    Ok(app_data_dir().join(format!("word-enrichment-{}.json", level)))
+}
+
+fn local_now_iso() -> String {
+    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()
+}
+
+fn local_date() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+fn local_iso_days_from_now(days: i64) -> String {
+    (chrono::Local::now() + chrono::Duration::days(days))
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string()
+}
+
+fn local_iso_days_ago(days: i64) -> String {
+    (chrono::Local::now() - chrono::Duration::days(days))
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string()
+}
+
+fn append_app_log(scope: &str, message: impl AsRef<str>) {
+    let _ = cleanup_app_logs();
+    let path = today_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(
+            file,
+            "{} [{}] {}",
+            local_now_iso(),
+            scope,
+            message.as_ref().replace('\n', "\\n")
+        );
+    }
+}
+
+fn cleanup_app_logs() -> Result<(), String> {
+    let path = logs_dir();
+    if !path.exists() {
+        return Ok(());
+    }
+    let expire_secs = 24 * 3600;
+    let now = std::time::SystemTime::now();
+    for entry in fs::read_dir(&path).map_err(|e| e.to_string())? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified = match metadata.modified() {
+            Ok(modified) => modified,
+            Err(_) => continue,
+        };
+        if now
+            .duration_since(modified)
+            .map(|duration| duration.as_secs() > expire_secs)
+            .unwrap_or(false)
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
+}
+
 fn get_db_path() -> PathBuf {
-    let mut path = dirs::data_dir().expect("无法获取数据目录");
-    path.push("vocab-master");
-    path.push("vocab.db");
-    path
+    app_data_file("vocab.db")
 }
 
 fn create_pool() -> Result<DbPool, String> {
@@ -240,6 +363,7 @@ fn init_tables(pool: &DbPool) -> Result<(), String> {
             date TEXT NOT NULL,
             new_words INTEGER DEFAULT 0,
             reviewed_words INTEGER DEFAULT 0,
+            fuzzy_count INTEGER DEFAULT 0,
             correct_count INTEGER DEFAULT 0,
             incorrect_count INTEGER DEFAULT 0,
             duration_seconds INTEGER DEFAULT 0,
@@ -259,11 +383,22 @@ fn init_tables(pool: &DbPool) -> Result<(), String> {
         );
         CREATE INDEX IF NOT EXISTS idx_qr_created_at ON quiz_records(created_at);
         CREATE INDEX IF NOT EXISTS idx_qr_level ON quiz_records(level);
+
+        CREATE TABLE IF NOT EXISTS daily_plan_status (
+            date TEXT NOT NULL,
+            level TEXT NOT NULL,
+            completed_at TEXT NOT NULL,
+            PRIMARY KEY(date, level)
+        );
         ",
     )
     .map_err(|e| e.to_string())?;
     let _ = conn.execute(
         "ALTER TABLE study_sessions ADD COLUMN duration_seconds INTEGER DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE study_sessions ADD COLUMN fuzzy_count INTEGER DEFAULT 0",
         [],
     );
     Ok(())
@@ -289,10 +424,7 @@ const PRESET_WORD_BANKS: &[(&str, &str)] = &[
 ];
 
 fn words_dir_path() -> PathBuf {
-    let mut path = dirs::data_dir().expect("无法获取数据目录");
-    path.push("vocab-master");
-    path.push("words");
-    path
+    app_data_dir().join("words")
 }
 
 fn validate_level(level: &str) -> Result<(), String> {
@@ -364,6 +496,13 @@ fn word_from_value(value: Value, index: usize, fallback_level: &str) -> Result<W
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
+        example_translation: obj
+            .get("example_translation")
+            .or_else(|| obj.get("example_zh"))
+            .or_else(|| obj.get("translation"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
         level: obj
             .get("level")
             .and_then(|v| v.as_str())
@@ -396,6 +535,13 @@ fn save_word_bank(level: &str, content: &str) -> Result<usize, String> {
     Ok(words.len())
 }
 
+fn write_word_bank(level: &str, words: &[Word]) -> Result<(), String> {
+    fs::create_dir_all(words_dir_path()).map_err(|e| e.to_string())?;
+    let path = word_bank_path(level)?;
+    let json = serde_json::to_string_pretty(words).map_err(|e| e.to_string())?;
+    fs::write(path, json).map_err(|e| e.to_string())
+}
+
 /// 获取词库目录路径
 #[tauri::command]
 fn get_words_dir() -> String {
@@ -409,6 +555,32 @@ fn ensure_words_dir() -> Result<String, String> {
     let path = words_dir_path();
     fs::create_dir_all(&path).map_err(|e| e.to_string())?;
     Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn get_logs_dir() -> Result<String, String> {
+    let path = logs_dir();
+    fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+    cleanup_app_logs()?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn clear_logs() -> Result<(), String> {
+    let path = logs_dir();
+    if !path.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&path).map_err(|e| e.to_string())? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        if entry.metadata().map(|m| m.is_file()).unwrap_or(false) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
 }
 
 /// 加载指定学段的词库
@@ -428,10 +600,274 @@ fn load_words(level: String) -> Result<Vec<Word>, String> {
     parse_word_bank(&level, &content)
 }
 
+#[tauri::command]
+fn get_study_words_between(
+    app: tauri::AppHandle,
+    level: String,
+    start_iso: String,
+    end_iso: String,
+) -> Result<Vec<Word>, String> {
+    validate_level(&level)?;
+    let words = load_words(level.clone())?;
+    let words_by_id: HashMap<i32, Word> = words.into_iter().map(|word| (word.id, word)).collect();
+    let pool = get_db(&app)?;
+    let conn = pool.get().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT word_id
+             FROM word_progress
+             WHERE level = ?1
+               AND last_seen IS NOT NULL
+               AND datetime(last_seen) >= datetime(?2)
+               AND datetime(last_seen) < datetime(?3)
+             ORDER BY datetime(last_seen) DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![level, start_iso, end_iso], |row| {
+            row.get::<_, i32>(0)
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for row in rows {
+        let word_id = row.map_err(|e| e.to_string())?;
+        if seen.insert(word_id) {
+            if let Some(word) = words_by_id.get(&word_id) {
+                result.push(word.clone());
+            }
+        }
+    }
+
+    Ok(result)
+}
+
 /// 导入或覆盖指定学段的词库
 #[tauri::command]
 fn import_words(level: String, content: String) -> Result<usize, String> {
     save_word_bank(&level, &content)
+}
+
+#[tauri::command]
+async fn auto_enrich_word_bank_examples(config: AppConfig, level: String) -> Result<Value, String> {
+    validate_level(&level)?;
+    if !has_usable_model_key(&config) {
+        append_app_log(
+            "word-enrich",
+            format!("skip level={} reason=no-api-key", level),
+        );
+        return Ok(json!({
+            "status": "skipped",
+            "message": "未配置可用 API Key"
+        }));
+    }
+
+    let mut words = load_words(level.clone())?;
+    let candidates: Vec<(usize, Word)> = words
+        .iter()
+        .cloned()
+        .enumerate()
+        .filter(|(_, word)| example_needs_enrichment(word))
+        .collect();
+    append_app_log(
+        "word-enrich",
+        format!("start level={} candidates={}", level, candidates.len()),
+    );
+
+    if candidates.is_empty() {
+        write_word_bank_enrichment_status(&level, "completed", 0, 0, "当前学段例句已补全")?;
+        append_app_log(
+            "word-enrich",
+            format!("completed level={} enriched=0", level),
+        );
+        return Ok(json!({
+            "status": "completed",
+            "enriched": 0,
+            "total": 0
+        }));
+    }
+
+    write_word_bank_enrichment_status(&level, "running", 0, candidates.len(), "正在后台补充例句")?;
+
+    let mut enriched = 0usize;
+    for chunk in candidates.chunks(12) {
+        let generated = enrich_example_chunk(&config, chunk).await?;
+        for (index, word) in chunk {
+            let key = word.word.to_ascii_lowercase();
+            if let Some(patch) = generated.get(&key) {
+                if !patch.example.trim().is_empty() {
+                    words[*index].example = patch.example.trim().to_string();
+                    words[*index].example_translation = patch.translation.trim().to_string();
+                    enriched += 1;
+                }
+            }
+        }
+        write_word_bank(&level, &words)?;
+        write_word_bank_enrichment_status(
+            &level,
+            "running",
+            enriched,
+            candidates.len(),
+            "正在后台补充例句",
+        )?;
+    }
+
+    write_word_bank_enrichment_status(
+        &level,
+        "completed",
+        enriched,
+        candidates.len(),
+        "例句补充完成",
+    )?;
+    append_app_log(
+        "word-enrich",
+        format!(
+            "completed level={} enriched={}/{}",
+            level,
+            enriched,
+            candidates.len()
+        ),
+    );
+    Ok(json!({
+        "status": "completed",
+        "enriched": enriched,
+        "total": candidates.len()
+    }))
+}
+
+async fn enrich_example_chunk(
+    config: &AppConfig,
+    chunk: &[(usize, Word)],
+) -> Result<HashMap<String, ExamplePatch>, String> {
+    let words_payload: Vec<Value> = chunk
+        .iter()
+        .map(|(_, word)| {
+            json!({
+                "word": word.word,
+                "definition": word.definition,
+                "current_example": word.example,
+                "current_translation": word.example_translation,
+                "level": word.level
+            })
+        })
+        .collect();
+    let prompt = serde_json::to_string(&json!({
+        "instruction": "请为每个单词补充或改写一个自然、简短、适合中国英语学习者的英文例句，并给出准确中文翻译。英文例句必须包含目标词原形或合理变形；不要改变单词本身；中文翻译不要解释语法，只翻译句意。",
+        "schema": {
+            "items": [
+                {
+                    "word": "abandon",
+                    "example": "He decided to abandon the old plan.",
+                    "translation": "他决定放弃这个旧计划。"
+                }
+            ]
+        },
+        "words": words_payload
+    }))
+    .map_err(|e| e.to_string())?;
+
+    let content = call_model_api(
+        config.clone(),
+        vec![
+            json!({
+                "role": "system",
+                "content": "你是英语词库编辑。只返回 JSON，不要返回 Markdown。"
+            }),
+            json!({
+                "role": "user",
+                "content": prompt
+            }),
+        ],
+    )
+    .await?;
+
+    let parsed = extract_json_from_response(&content);
+    let items = parsed
+        .get("items")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut result = HashMap::new();
+    for item in items {
+        let word = item
+            .get("word")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let example = item
+            .get("example")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let translation = item
+            .get("translation")
+            .or_else(|| item.get("example_translation"))
+            .or_else(|| item.get("example_zh"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !word.is_empty() && !example.is_empty() {
+            result.insert(
+                word,
+                ExamplePatch {
+                    example,
+                    translation,
+                },
+            );
+        }
+    }
+    Ok(result)
+}
+
+fn example_needs_enrichment(word: &Word) -> bool {
+    let example = word.example.trim();
+    if example.is_empty() {
+        return true;
+    }
+    if word.example_translation.trim().is_empty() {
+        return true;
+    }
+    let has_sentence_punctuation =
+        example.contains('.') || example.contains('!') || example.contains('?');
+    let has_space = example.split_whitespace().count() >= 4;
+    !has_sentence_punctuation || !has_space
+}
+
+fn has_usable_model_key(config: &AppConfig) -> bool {
+    let key = config.model.api_key.trim();
+    !key.is_empty()
+        && !matches!(
+            key.to_ascii_lowercase().as_str(),
+            "api_key" | "your_api_key" | "your-api-key" | "sk-xxx" | "sk-xxxx"
+        )
+}
+
+fn write_word_bank_enrichment_status(
+    level: &str,
+    status: &str,
+    enriched: usize,
+    total: usize,
+    message: &str,
+) -> Result<(), String> {
+    let path = word_bank_enrichment_status_path(level)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let content = serde_json::to_string_pretty(&json!({
+        "level": level,
+        "status": status,
+        "enriched": enriched,
+        "total": total,
+        "message": message,
+        "updated_at": local_now_iso()
+    }))
+    .map_err(|e| e.to_string())?;
+    fs::write(path, content).map_err(|e| e.to_string())
 }
 
 /// 获取今日学习队列：到期复习词 + 新词
@@ -450,6 +886,7 @@ fn get_study_queue(
 
     let mut queue = Vec::new();
     let mut used_ids = HashSet::new();
+    let now = local_now_iso();
 
     if review_count > 0 {
         let mut stmt = conn
@@ -457,15 +894,16 @@ fn get_study_queue(
                 "SELECT word_id FROM word_progress
                  WHERE level = ?1
                    AND status != 'new'
-                   AND (next_review IS NULL OR next_review <= datetime('now') OR status = 'hard')
-                 ORDER BY COALESCE(next_review, '1970-01-01 00:00:00') ASC,
+                   AND (next_review IS NULL OR next_review <= ?2 OR status = 'hard')
+                 ORDER BY CASE status WHEN 'hard' THEN 0 WHEN 'learning' THEN 1 ELSE 2 END ASC,
+                          COALESCE(next_review, '1970-01-01 00:00:00') ASC,
                           wrong_count DESC,
                           last_seen ASC
-                 LIMIT ?2",
+                 LIMIT ?3",
             )
             .map_err(|e| e.to_string())?;
         let review_ids: Vec<i32> = stmt
-            .query_map(params![level.as_str(), review_count as i64], |row| {
+            .query_map(params![level.as_str(), now, review_count as i64], |row| {
                 row.get(0)
             })
             .map_err(|e| e.to_string())?
@@ -515,34 +953,59 @@ async fn play_word_audio(word: String) -> Result<String, String> {
 async fn cache_word_audio(word: &str) -> Result<String, String> {
     let _ = cleanup_audio_cache(1);
     let client = reqwest::Client::new();
+    append_app_log("audio", format!("lookup word={}", word));
     let audio_url = lookup_audio_url(&client, word).await?;
-    let cache_path = audio_cache_file_path(word, &audio_url)?;
 
     let resp = client
         .get(&audio_url)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        )
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
-        .map_err(|e| format!("发音下载失败：{}", e))?;
+        .map_err(|e| {
+            append_app_log(
+                "audio",
+                format!("download failed word={} url={} err={}", word, audio_url, e),
+            );
+            format!("发音下载失败：{}", e)
+        })?;
 
     if !resp.status().is_success() {
+        append_app_log(
+            "audio",
+            format!("download http word={} status={}", word, resp.status()),
+        );
         return Err(format!("发音下载失败：HTTP {}", resp.status()));
     }
 
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("发音读取失败：{}", e))?;
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
+        .filter(|value| value.starts_with("audio/"));
+    let bytes = resp.bytes().await.map_err(|e| {
+        append_app_log("audio", format!("read failed word={} err={}", word, e));
+        format!("发音读取失败：{}", e)
+    })?;
     if bytes.is_empty() {
+        append_app_log("audio", format!("empty audio word={}", word));
         return Err("发音文件为空".into());
     }
 
-    if let Some(parent) = cache_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    fs::write(&cache_path, bytes.as_ref()).map_err(|e| e.to_string())?;
-
-    Ok(cache_path.to_string_lossy().to_string())
+    let mime = content_type.unwrap_or_else(|| guess_audio_mime(&audio_url));
+    append_app_log(
+        "audio",
+        format!("ready word={} mime={} bytes={}", word, mime, bytes.len()),
+    );
+    Ok(format!(
+        "data:{};base64,{}",
+        mime,
+        general_purpose::STANDARD.encode(bytes.as_ref())
+    ))
 }
 
 async fn lookup_audio_url(client: &reqwest::Client, word: &str) -> Result<String, String> {
@@ -551,34 +1014,42 @@ async fn lookup_audio_url(client: &reqwest::Client, word: &str) -> Result<String
         urlencoding::encode(word)
     );
 
-    let resp = client
+    let resp = match client
         .get(&url)
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+    {
+        Ok(resp) => resp,
+        Err(_) => return Ok(fallback_tts_url(word)),
+    };
 
     if !resp.status().is_success() {
-        return Err(format!("未找到单词 '{}' 的发音", word));
+        return Ok(fallback_tts_url(word));
     }
 
     let entries: Vec<Value> = resp.json().await.map_err(|e| e.to_string())?;
     if entries.is_empty() {
-        return Err(format!("未找到单词 '{}' 的发音", word));
+        return Ok(fallback_tts_url(word));
     }
 
     let phonetics = &entries[0]["phonetics"];
+    let mut candidates = Vec::new();
     if let Some(arr) = phonetics.as_array() {
         for p in arr {
             if let Some(audio) = p["audio"].as_str() {
                 if !audio.is_empty() {
-                    return Ok(normalize_audio_url(audio));
+                    candidates.push(normalize_audio_url(audio));
                 }
             }
         }
     }
 
-    Err(format!("单词 '{}' 没有可用的音频", word))
+    if let Some(url) = candidates.iter().find(|url| is_preferred_audio_url(url)) {
+        return Ok(url.clone());
+    }
+
+    Ok(fallback_tts_url(word))
 }
 
 fn normalize_audio_url(url: &str) -> String {
@@ -589,9 +1060,23 @@ fn normalize_audio_url(url: &str) -> String {
     }
 }
 
+fn is_preferred_audio_url(url: &str) -> bool {
+    let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+    path.ends_with(".mp3")
+        || path.ends_with(".wav")
+        || path.ends_with(".m4a")
+        || path.ends_with(".mp4")
+}
+
+fn fallback_tts_url(word: &str) -> String {
+    format!(
+        "https://dict.youdao.com/dictvoice?type=2&audio={}",
+        urlencoding::encode(word)
+    )
+}
+
 fn audio_cache_file_path(word: &str, audio_url: &str) -> Result<PathBuf, String> {
-    let mut path = dirs::cache_dir().ok_or("无法获取缓存目录")?;
-    path.push("vocab-master-audio");
+    let mut path = audio_cache_dir();
 
     let file_name = safe_audio_file_name(word);
     let extension = audio_url
@@ -609,6 +1094,23 @@ fn audio_cache_file_path(word: &str, audio_url: &str) -> Result<PathBuf, String>
         extension
     ));
     Ok(path)
+}
+
+fn guess_audio_mime(audio_url: &str) -> String {
+    let path = audio_url.split('?').next().unwrap_or(audio_url);
+    match path
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "ogg" | "oga" => "audio/ogg".into(),
+        "wav" => "audio/wav".into(),
+        "m4a" | "mp4" => "audio/mp4".into(),
+        "webm" => "audio/webm".into(),
+        _ => "audio/mpeg".into(),
+    }
 }
 
 fn safe_audio_file_name(word: &str) -> String {
@@ -632,18 +1134,52 @@ fn safe_audio_file_name(word: &str) -> String {
     }
 }
 
+fn progress_counts(conn: &Connection, word_id: i32) -> (i32, i32) {
+    conn.query_row(
+        "SELECT review_count, wrong_count FROM word_progress WHERE word_id = ?1",
+        params![word_id],
+        |row| Ok((row.get::<_, i32>(0)?, row.get::<_, i32>(1)?)),
+    )
+    .unwrap_or((0, 0))
+}
+
+fn next_review_for_remembered(review_count: i32, wrong_count: i32) -> String {
+    let intervals: &[i64] = if wrong_count > 0 {
+        &[1, 2, 4, 7, 15, 30]
+    } else {
+        &[1, 3, 7, 15, 30, 60]
+    };
+    let index = review_count.saturating_sub(1) as usize;
+    let days = intervals
+        .get(index)
+        .copied()
+        .unwrap_or_else(|| *intervals.last().unwrap_or(&30));
+    local_iso_days_from_now(days)
+}
+
+fn next_review_for_fuzzy(review_count: i32, wrong_count: i32) -> String {
+    let days = if wrong_count > 0 || review_count <= 1 {
+        1
+    } else {
+        2
+    };
+    local_iso_days_from_now(days)
+}
+
 #[tauri::command]
 fn mark_word_learned(app: tauri::AppHandle, word: Word) -> Result<(), String> {
     let pool = get_db(&app)?;
     let conn = pool.get().map_err(|e| e.to_string())?;
-    let now = chrono::Utc::now().to_rfc3339();
     let word_id = word.id;
+    let (review_count, wrong_count) = progress_counts(&conn, word_id);
+    let next_review = next_review_for_remembered(review_count + 1, wrong_count);
+    let now = local_now_iso();
     let word_text = word.word;
     let level = word.level;
     conn.execute(
         "INSERT INTO word_progress
-            (word_id, word, level, status, last_seen, review_count, correct_count, wrong_count, next_review)
-         VALUES (?1, ?2, ?3, 'mastered', ?4, 1, 1, 0, datetime('now', '+30 days'))
+            (word_id, word, level, status, last_seen, review_count, correct_count, wrong_count, next_review, created_at)
+         VALUES (?1, ?2, ?3, 'mastered', ?4, 1, 1, 0, ?5, ?4)
          ON CONFLICT(word_id) DO UPDATE SET
             word = excluded.word,
             level = excluded.level,
@@ -651,10 +1187,57 @@ fn mark_word_learned(app: tauri::AppHandle, word: Word) -> Result<(), String> {
             last_seen = excluded.last_seen,
             review_count = word_progress.review_count + 1,
             correct_count = word_progress.correct_count + 1,
-            next_review = datetime('now', '+30 days')",
-        params![word_id, word_text, level, now],
+            next_review = excluded.next_review",
+        params![
+            word_id,
+            word_text.as_str(),
+            level.as_str(),
+            now.as_str(),
+            next_review.as_str()
+        ],
     )
     .map_err(|e| e.to_string())?;
+    append_app_log(
+        "study",
+        format!("remembered word_id={} level={}", word_id, level),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+fn mark_word_fuzzy(app: tauri::AppHandle, word: Word) -> Result<(), String> {
+    let pool = get_db(&app)?;
+    let conn = pool.get().map_err(|e| e.to_string())?;
+    let word_id = word.id;
+    let (review_count, wrong_count) = progress_counts(&conn, word_id);
+    let next_review = next_review_for_fuzzy(review_count + 1, wrong_count);
+    let now = local_now_iso();
+    let word_text = word.word;
+    let level = word.level;
+    conn.execute(
+        "INSERT INTO word_progress
+            (word_id, word, level, status, last_seen, review_count, correct_count, wrong_count, next_review, created_at)
+         VALUES (?1, ?2, ?3, 'learning', ?4, 1, 0, 0, ?5, ?4)
+         ON CONFLICT(word_id) DO UPDATE SET
+            word = excluded.word,
+            level = excluded.level,
+            status = 'learning',
+            last_seen = excluded.last_seen,
+            review_count = word_progress.review_count + 1,
+            next_review = excluded.next_review",
+        params![
+            word_id,
+            word_text.as_str(),
+            level.as_str(),
+            now.as_str(),
+            next_review.as_str()
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    append_app_log(
+        "study",
+        format!("fuzzy word_id={} level={}", word_id, level),
+    );
     Ok(())
 }
 
@@ -663,14 +1246,15 @@ fn mark_word_learned(app: tauri::AppHandle, word: Word) -> Result<(), String> {
 fn mark_word_hard(app: tauri::AppHandle, word: Word) -> Result<(), String> {
     let pool = get_db(&app)?;
     let conn = pool.get().map_err(|e| e.to_string())?;
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = local_now_iso();
+    let next_review = local_iso_days_from_now(1);
     let word_id = word.id;
     let word_text = word.word;
     let level = word.level;
     conn.execute(
         "INSERT INTO word_progress
-            (word_id, word, level, status, last_seen, review_count, correct_count, wrong_count, next_review)
-         VALUES (?1, ?2, ?3, 'hard', ?4, 1, 0, 1, datetime('now', '+1 day'))
+            (word_id, word, level, status, last_seen, review_count, correct_count, wrong_count, next_review, created_at)
+         VALUES (?1, ?2, ?3, 'hard', ?4, 1, 0, 1, ?5, ?4)
          ON CONFLICT(word_id) DO UPDATE SET
             word = excluded.word,
             level = excluded.level,
@@ -678,10 +1262,17 @@ fn mark_word_hard(app: tauri::AppHandle, word: Word) -> Result<(), String> {
             last_seen = excluded.last_seen,
             review_count = word_progress.review_count + 1,
             wrong_count = word_progress.wrong_count + 1,
-            next_review = datetime('now', '+1 day')",
-        params![word_id, word_text, level, now],
+            next_review = excluded.next_review",
+        params![
+            word_id,
+            word_text.as_str(),
+            level.as_str(),
+            now.as_str(),
+            next_review.as_str()
+        ],
     )
     .map_err(|e| e.to_string())?;
+    append_app_log("study", format!("hard word_id={} level={}", word_id, level));
     Ok(())
 }
 
@@ -690,29 +1281,32 @@ fn mark_word_hard(app: tauri::AppHandle, word: Word) -> Result<(), String> {
 fn save_progress(app: tauri::AppHandle, data: Value) -> Result<(), String> {
     let pool = get_db(&app)?;
     let mut conn = pool.get().map_err(|e| e.to_string())?;
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let today = local_date();
+    let created_at = local_now_iso();
 
     conn.execute(
-        "INSERT INTO study_sessions (date, new_words, reviewed_words, correct_count, incorrect_count, duration_seconds)
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO study_sessions (date, new_words, reviewed_words, fuzzy_count, correct_count, incorrect_count, duration_seconds, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             today,
             data.get("new_words").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             data.get("reviewed_words").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            data.get("fuzzy_count").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             data.get("correct_count").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             data.get("incorrect_count").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
             data.get("duration_seconds")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0) as i32,
+            created_at,
         ],
     )
     .map_err(|e| e.to_string())?;
 
     // 保存旧版 JSON 兼容格式（用于向后兼容）
-    let mut path = dirs::data_dir().expect("无法获取数据目录");
-    path.push("vocab-master");
-    fs::create_dir_all(&path).map_err(|e| e.to_string())?;
-    path.push("progress.json");
+    let path = progress_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
     let json_str = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
     fs::write(path, json_str).map_err(|e| e.to_string())?;
     Ok(())
@@ -727,7 +1321,8 @@ fn save_quiz_record(
 ) -> Result<(), String> {
     let pool = get_db(&app)?;
     let conn = pool.get().map_err(|e| e.to_string())?;
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let today = local_date();
+    let created_at = local_now_iso();
     let level = record
         .get("level")
         .and_then(|v| v.as_str())
@@ -752,9 +1347,17 @@ fn save_quiz_record(
     let payload = serde_json::to_string(&record).map_err(|e| e.to_string())?;
 
     conn.execute(
-        "INSERT INTO quiz_records (date, level, score, summary, advice, payload)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![today, level, score, summary, advice_json, payload],
+        "INSERT INTO quiz_records (date, level, score, summary, advice, payload, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            today,
+            level,
+            score,
+            summary,
+            advice_json,
+            payload,
+            created_at
+        ],
     )
     .map_err(|e| e.to_string())?;
 
@@ -902,10 +1505,10 @@ fn get_wrong_book(app: tauri::AppHandle) -> Result<Vec<Value>, String> {
 
 fn cleanup_quiz_records(conn: &Connection, retention_days: u32) -> Result<(), String> {
     let days = retention_days.clamp(1, 3650);
-    let modifier = format!("-{} days", days);
+    let threshold = local_iso_days_ago(days as i64);
     conn.execute(
-        "DELETE FROM quiz_records WHERE datetime(created_at) < datetime('now', ?1)",
-        params![modifier],
+        "DELETE FROM quiz_records WHERE created_at < ?1",
+        params![threshold],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -918,7 +1521,7 @@ fn get_learning_records(app: tauri::AppHandle) -> Result<Value, String> {
 
     let mut session_stmt = conn
         .prepare(
-            "SELECT id, date, new_words, reviewed_words, correct_count, incorrect_count, duration_seconds, created_at
+            "SELECT id, date, new_words, reviewed_words, fuzzy_count, correct_count, incorrect_count, duration_seconds, created_at
              FROM study_sessions
              ORDER BY datetime(created_at) DESC, id DESC
              LIMIT 50",
@@ -931,10 +1534,11 @@ fn get_learning_records(app: tauri::AppHandle) -> Result<Value, String> {
                 "date": row.get::<_, String>(1)?,
                 "new_words": row.get::<_, i32>(2)?,
                 "reviewed_words": row.get::<_, i32>(3)?,
-                "correct_count": row.get::<_, i32>(4)?,
-                "incorrect_count": row.get::<_, i32>(5)?,
-                "duration_seconds": row.get::<_, i32>(6)?,
-                "created_at": row.get::<_, String>(7)?,
+                "fuzzy_count": row.get::<_, i32>(4)?,
+                "correct_count": row.get::<_, i32>(5)?,
+                "incorrect_count": row.get::<_, i32>(6)?,
+                "duration_seconds": row.get::<_, i32>(7)?,
+                "created_at": row.get::<_, String>(8)?,
             }))
         })
         .map_err(|e| e.to_string())?
@@ -1028,11 +1632,115 @@ fn clear_learning_records(app: tauri::AppHandle, scope: String) -> Result<(), St
 }
 
 fn remove_legacy_progress_file() {
-    if let Some(mut path) = dirs::data_dir() {
-        path.push("vocab-master");
-        path.push("progress.json");
-        let _ = fs::remove_file(path);
+    let _ = fs::remove_file(progress_path());
+}
+
+#[tauri::command]
+fn mark_daily_plan_complete(
+    app: tauri::AppHandle,
+    level: String,
+    date: String,
+) -> Result<(), String> {
+    validate_level(&level)?;
+    let pool = get_db(&app)?;
+    let conn = pool.get().map_err(|e| e.to_string())?;
+    let completed_at = local_now_iso();
+    conn.execute(
+        "INSERT INTO daily_plan_status (date, level, completed_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(date, level) DO UPDATE SET completed_at = excluded.completed_at",
+        params![date, level, completed_at],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn is_daily_plan_complete(
+    app: tauri::AppHandle,
+    level: String,
+    date: String,
+) -> Result<bool, String> {
+    validate_level(&level)?;
+    let pool = get_db(&app)?;
+    let conn = pool.get().map_err(|e| e.to_string())?;
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM daily_plan_status WHERE date = ?1 AND level = ?2",
+            params![date, level],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    Ok(count > 0)
+}
+
+#[tauri::command]
+fn get_review_forecast(app: tauri::AppHandle, level: String) -> Result<Value, String> {
+    validate_level(&level)?;
+    let pool = get_db(&app)?;
+    let conn = pool.get().map_err(|e| e.to_string())?;
+    let now = local_now_iso();
+    let tomorrow = local_iso_days_from_now(1);
+
+    let due_now: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM word_progress
+             WHERE level = ?1 AND status != 'new' AND next_review IS NOT NULL AND next_review <= ?2",
+            params![level.as_str(), now],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let due_tomorrow: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM word_progress
+             WHERE level = ?1 AND status != 'new' AND next_review IS NOT NULL AND next_review <= ?2",
+            params![level.as_str(), tomorrow],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let hard_words: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM word_progress WHERE level = ?1 AND status = 'hard'",
+            params![level.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let fuzzy_words: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM word_progress WHERE level = ?1 AND status = 'learning'",
+            params![level.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    Ok(json!({
+        "due_now": due_now,
+        "due_tomorrow": due_tomorrow,
+        "hard_words": hard_words,
+        "fuzzy_words": fuzzy_words,
+        "curve": "1/3/7/15/30/60 days, slowed for previously wrong words"
+    }))
+}
+
+#[tauri::command]
+fn get_next_plan() -> Result<Value, String> {
+    let path = next_plan_path();
+    if !path.exists() {
+        return Ok(Value::Null);
     }
+    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&content).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn save_next_plan(record: Value) -> Result<(), String> {
+    let path = next_plan_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let content = serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?;
+    fs::write(path, content).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1216,7 +1924,7 @@ fn compute_streak(conn: &Connection) -> Result<i64, String> {
     }
 
     let mut streak = 0i64;
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let today = local_date();
     let mut expected = chrono::NaiveDate::parse_from_str(&today, "%Y-%m-%d")
         .ok()
         .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
@@ -1262,9 +1970,7 @@ fn format_duration(total_seconds: i64) -> String {
 }
 
 fn get_dashboard_from_json(active_level: &str, total_words: i32) -> Result<DashboardData, String> {
-    let mut path = dirs::data_dir().expect("无法获取数据目录");
-    path.push("vocab-master");
-    path.push("progress.json");
+    let path = progress_path();
 
     let (total_learned, mastery_rate, streak_days, total_time, level_data, daily_data, wrong_data) =
         if path.exists() {
@@ -1433,9 +2139,7 @@ fn get_dashboard_from_json(active_level: &str, total_words: i32) -> Result<Dashb
 /// 获取配置
 #[tauri::command]
 fn get_config() -> Result<AppConfig, String> {
-    let mut path = dirs::config_dir().expect("无法获取配置目录");
-    path.push("vocab-master");
-    path.push("config.toml");
+    let path = config_path();
 
     if !path.exists() {
         return Ok(AppConfig::default());
@@ -1448,10 +2152,10 @@ fn get_config() -> Result<AppConfig, String> {
 /// 保存配置
 #[tauri::command]
 fn save_config(config: AppConfig) -> Result<(), String> {
-    let mut path = dirs::config_dir().expect("无法获取配置目录");
-    path.push("vocab-master");
-    fs::create_dir_all(&path).map_err(|e| e.to_string())?;
-    path.push("config.toml");
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
 
     let toml = toml::to_string_pretty(&config).map_err(|e| e.to_string())?;
     fs::write(path, toml).map_err(|e| e.to_string())?;
@@ -1462,6 +2166,15 @@ fn save_config(config: AppConfig) -> Result<(), String> {
 #[tauri::command]
 async fn call_model_api(config: AppConfig, messages: Vec<Value>) -> Result<String, String> {
     let client = reqwest::Client::new();
+    append_app_log(
+        "model",
+        format!(
+            "request model={} url={} messages={}",
+            config.model.model_name,
+            config.model.api_url,
+            messages.len()
+        ),
+    );
     let body = json!({
         "model": config.model.model_name,
         "messages": messages,
@@ -1476,15 +2189,32 @@ async fn call_model_api(config: AppConfig, messages: Vec<Value>) -> Result<Strin
         .json(&body)
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            append_app_log("model", format!("request failed err={}", e));
+            e.to_string()
+        })?;
 
-    let json: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    if !status.is_success() {
+        append_app_log("model", format!("http status={}", status));
+    }
+    let json: Value = resp.json().await.map_err(|e| {
+        append_app_log("model", format!("json parse failed err={}", e));
+        e.to_string()
+    })?;
     let content = json["choices"][0]["message"]["content"]
         .as_str()
-        .ok_or("模型返回为空")?
+        .ok_or_else(|| {
+            append_app_log("model", "empty response");
+            "模型返回为空"
+        })?
         .trim()
         .to_string();
 
+    append_app_log(
+        "model",
+        format!("response chars={}", content.chars().count()),
+    );
     Ok(content)
 }
 
@@ -1702,8 +2432,7 @@ fn parse_duckduckgo_html(html: &str) -> Vec<SearchResult> {
 /// 清理过期音频文件
 #[tauri::command]
 fn cleanup_audio_cache(expire_hours: u64) -> Result<(), String> {
-    let mut path = dirs::cache_dir().ok_or("无法获取缓存目录")?;
-    path.push("vocab-master-audio");
+    let path = audio_cache_dir();
 
     if !path.exists() {
         return Ok(());
@@ -1739,6 +2468,8 @@ fn cleanup_audio_cache(expire_hours: u64) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
+            let _ = cleanup_app_logs();
+            append_app_log("app", "startup");
             // 初始化数据库连接池并注册为共享状态
             let pool = create_pool().map_err(|e| e.to_string())?;
             init_tables(&pool).map_err(|e| e.to_string())?;
@@ -1748,11 +2479,16 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_words_dir,
             ensure_words_dir,
+            get_logs_dir,
+            clear_logs,
             load_words,
+            get_study_words_between,
             import_words,
+            auto_enrich_word_bank_examples,
             get_study_queue,
             play_word_audio,
             mark_word_learned,
+            mark_word_fuzzy,
             mark_word_hard,
             get_dashboard_data,
             save_progress,
@@ -1762,6 +2498,11 @@ pub fn run() {
             get_learning_records,
             delete_learning_record,
             clear_learning_records,
+            mark_daily_plan_complete,
+            is_daily_plan_complete,
+            get_review_forecast,
+            get_next_plan,
+            save_next_plan,
             get_config,
             save_config,
             call_model_api,

@@ -17,7 +17,7 @@
           </button>
         </div>
 
-        <div class="mt-4 grid grid-cols-2 gap-2 rounded-2xl bg-slate-100 p-1 sm:grid-cols-5">
+        <div class="mt-4 grid grid-cols-2 gap-2 rounded-2xl bg-slate-100 p-1 sm:grid-cols-6">
           <button
             v-for="tab in tabs"
             :key="tab.key"
@@ -181,7 +181,7 @@
                     <div>
                       <p class="font-semibold text-slate-900">{{ item.date }}</p>
                       <p class="mt-1 text-sm text-slate-500">
-                        新词 {{ item.new_words }} · 复习 {{ item.reviewed_words }} · 正确 {{ item.correct_count }} · 错误 {{ item.incorrect_count }}
+                        新词 {{ item.new_words }} · 复习 {{ item.reviewed_words }} · 模糊 {{ item.fuzzy_count || 0 }} · 正确 {{ item.correct_count }} · 错误 {{ item.incorrect_count }}
                       </p>
                     </div>
                     <button type="button" class="text-sm font-semibold text-red-600 hover:text-red-700" @click="deleteRecord('session', item.id)">删除</button>
@@ -237,7 +237,7 @@
               </label>
               <label class="block">
                 <span class="label">API 密钥</span>
-                <input v-model="config.model.api_key" type="password" class="field" />
+                <input v-model="config.model.api_key" type="password" class="field" autocomplete="new-password" spellcheck="false" placeholder="保存后用于 AI 生成，不设置默认值" />
               </label>
               <div class="grid gap-4 sm:grid-cols-3">
                 <label class="block">
@@ -268,6 +268,24 @@
               <textarea v-model="promptEdit" rows="5" class="field min-h-32 resize-y" placeholder="用 {var} 表示变量..."></textarea>
               <button type="button" class="btn-secondary" @click="savePrompt">保存当前提示词</button>
             </div>
+          </div>
+        </section>
+
+        <section v-else-if="activeTab === 'logs'" class="space-y-5">
+          <div class="panel">
+            <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 class="section-title mb-1">运行日志</h3>
+                <p class="text-sm text-slate-500">日志仅保留 1 天，写入安装目录下的 vocab-master-data/logs。</p>
+              </div>
+              <button type="button" class="btn-secondary" @click="loadLogsDir">刷新</button>
+            </div>
+            <label class="block">
+              <span class="label">日志目录</span>
+              <input :value="logsDir || '正在读取...'" readonly class="field" />
+            </label>
+            <p v-if="logsMessage" class="mt-3 text-sm text-emerald-600">{{ logsMessage }}</p>
+            <button type="button" class="danger-btn mt-4" @click="clearAppLogs">清空日志</button>
           </div>
         </section>
 
@@ -320,6 +338,7 @@ const tabs = [
   { key: 'records', label: '记录' },
   { key: 'ai', label: 'AI' },
   { key: 'search', label: '搜索' },
+  { key: 'logs', label: '日志' },
 ]
 
 const activeTab = ref('study')
@@ -385,6 +404,8 @@ const importPreview = ref([])
 const importStats = reactive({ total: 0, duplicates: 0 })
 const fileInput = ref(null)
 const recordLoading = ref(false)
+const logsDir = ref('')
+const logsMessage = ref('')
 const learningRecords = reactive({
   sessions: [],
   quizzes: [],
@@ -393,6 +414,7 @@ const learningRecords = reactive({
 
 invoke('get_config').then(data => {
   if (data.model) Object.assign(config.model, data.model)
+  config.model.api_key = sanitizeApiKey(config.model.api_key)
   if (data.search) Object.assign(config.search, data.search)
   config.audio_expire_hours = data.audio_expire_hours ?? config.audio_expire_hours
   config.record_retention_days = data.record_retention_days ?? config.record_retention_days
@@ -422,6 +444,8 @@ watch(selectedPrompt, (val) => {
 watch(activeTab, (val) => {
   if (val === 'records') {
     loadLearningRecords()
+  } else if (val === 'logs') {
+    loadLogsDir()
   }
 })
 
@@ -561,6 +585,27 @@ async function clearRecords(scope) {
   }
 }
 
+async function loadLogsDir() {
+  try {
+    logsDir.value = await invoke('get_logs_dir')
+    logsMessage.value = ''
+  } catch (e) {
+    logsDir.value = ''
+    logsMessage.value = `读取日志目录失败：${e}`
+  }
+}
+
+async function clearAppLogs() {
+  if (!confirm('确认清空运行日志？')) return
+  try {
+    await invoke('clear_logs')
+    logsMessage.value = '日志已清空。'
+    await loadLogsDir()
+  } catch (e) {
+    logsMessage.value = `清空日志失败：${e}`
+  }
+}
+
 function addPrompt() {
   const name = prompt('请输入提示词名称:')
   if (name && !config.prompts[name]) {
@@ -578,6 +623,7 @@ function savePrompt() {
 
 async function saveAll() {
   try {
+    config.model.api_key = sanitizeApiKey(config.model.api_key)
     config.daily_new_words = Math.max(1, Number(config.daily_new_words) || 20)
     config.daily_review_words = Math.max(0, Number(config.daily_review_words) || 0)
     config.card_detail_seconds = Math.min(10, Math.max(1, Number(config.card_detail_seconds) || 2))
@@ -589,6 +635,15 @@ async function saveAll() {
   } catch (e) {
     alert('保存失败: ' + e)
   }
+}
+
+function sanitizeApiKey(value) {
+  const key = String(value || '').trim()
+  const lower = key.toLowerCase()
+  if (['api_key', 'your_api_key', 'your-api-key', 'sk-xxx', 'sk-xxxx'].includes(lower)) {
+    return ''
+  }
+  return key
 }
 </script>
 
