@@ -142,8 +142,18 @@
   </div>
 </template>
 
+<script>
+const quizQuestionCache = new Map()
+const quizQuestionRequests = new Map()
+const quizPageState = {
+  selectedExamType: 'mixed',
+  quizSize: 10,
+  activeGenerationKey: '',
+}
+</script>
+
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 
 const levelOptions = [
@@ -171,18 +181,30 @@ const todayWords = ref([])
 const dailyPlanComplete = ref(false)
 const questions = ref([])
 const answers = ref([])
-const quizSize = ref(10)
-const selectedExamType = ref('mixed')
+const quizSize = ref(quizPageState.quizSize)
+const selectedExamType = ref(quizPageState.selectedExamType)
 const loading = ref(false)
 const started = ref(false)
 const generating = ref(false)
 const grading = ref(false)
 const result = ref(null)
+let quizViewVersion = 0
 
 const levelName = computed(() => levelOptions.find(item => item.key === level.value)?.label || level.value)
 const availableQuizCount = computed(() => Math.min(quizSize.value, todayWords.value.length))
 
 onMounted(loadWords)
+onBeforeUnmount(() => {
+  quizViewVersion++
+})
+
+watch([selectedExamType, quizSize], () => {
+  quizPageState.selectedExamType = selectedExamType.value
+  quizPageState.quizSize = quizSize.value
+  if (started.value || generating.value || result.value) {
+    resetQuiz()
+  }
+})
 
 async function loadWords() {
   loading.value = true
@@ -196,6 +218,7 @@ async function loadWords() {
   } finally {
     loading.value = false
   }
+  restoreActiveQuizGeneration().catch(e => console.warn('恢复题目生成状态失败:', e))
 }
 
 async function refreshQuizSource() {
@@ -209,6 +232,7 @@ async function refreshQuizSource() {
 }
 
 async function startQuiz() {
+  const version = ++quizViewVersion
   result.value = null
   started.value = true
   generating.value = true
@@ -223,15 +247,21 @@ async function startQuiz() {
       return
     }
     seedWords = selectQuizSeedWords()
-    questions.value = hasModelApiKey()
-      ? await generateAiQuestions(seedWords)
-      : buildLocalQuestions(seedWords)
+    const context = createQuizGenerationContext(seedWords)
+    quizPageState.activeGenerationKey = context.key
+    const generatedQuestions = await getGeneratedQuestions(context, seedWords)
+    if (version !== quizViewVersion) return
+    questions.value = generatedQuestions
   } catch (e) {
     console.warn('AI 生成题目失败，使用本地题目:', e)
-    questions.value = buildLocalQuestions(seedWords)
+    if (version === quizViewVersion) {
+      questions.value = buildLocalQuestions(seedWords)
+    }
   } finally {
-    answers.value = questions.value.map(() => '')
-    generating.value = false
+    if (version === quizViewVersion) {
+      answers.value = questions.value.map(() => '')
+      generating.value = false
+    }
   }
 }
 
@@ -324,8 +354,8 @@ function buildLocalResult() {
   }
 }
 
-function hasModelApiKey() {
-  const key = String(config.value?.model?.api_key || '').trim()
+function hasModelApiKey(configValue = config.value) {
+  const key = String(configValue?.model?.api_key || '').trim()
   return Boolean(key && !isPlaceholderApiKey(key))
 }
 
@@ -335,6 +365,129 @@ function isPlaceholderApiKey(key) {
 
 function selectQuizSeedWords() {
   return todayWords.value.slice(0, Math.min(quizSize.value, todayWords.value.length))
+}
+
+async function restoreActiveQuizGeneration() {
+  if (started.value || result.value || loading.value || !dailyPlanComplete.value || todayWords.value.length === 0) return
+  const seedWords = selectQuizSeedWords()
+  const context = createQuizGenerationContext(seedWords)
+  pruneQuizQuestionCache(context.date)
+  if (context.key !== quizPageState.activeGenerationKey) return
+
+  const cached = readCachedGeneratedQuestions(context)
+  if (cached) {
+    started.value = true
+    generating.value = false
+    questions.value = cached
+    answers.value = cached.map(() => '')
+    return
+  }
+
+  const request = quizQuestionRequests.get(context.key)
+  if (!request) return
+  const version = ++quizViewVersion
+  started.value = true
+  generating.value = true
+  result.value = null
+  try {
+    const generatedQuestions = await request
+    if (version !== quizViewVersion) return
+    questions.value = cloneQuestions(generatedQuestions)
+    answers.value = questions.value.map(() => '')
+  } finally {
+    if (version === quizViewVersion) {
+      generating.value = false
+    }
+  }
+}
+
+async function getGeneratedQuestions(context, seedWords) {
+  pruneQuizQuestionCache(context.date)
+  const cached = readCachedGeneratedQuestions(context)
+  if (cached) return cached
+
+  if (!quizQuestionRequests.has(context.key)) {
+    const request = buildGeneratedQuestions(context, seedWords)
+      .then(generatedQuestions => {
+        const cloned = cloneQuestions(generatedQuestions)
+        quizQuestionCache.set(context.key, {
+          date: context.date,
+          questions: cloned,
+        })
+        return cloned
+      })
+      .finally(() => {
+        quizQuestionRequests.delete(context.key)
+      })
+    quizQuestionRequests.set(context.key, request)
+  }
+
+  const generatedQuestions = await quizQuestionRequests.get(context.key)
+  return cloneQuestions(generatedQuestions)
+}
+
+async function buildGeneratedQuestions(context, seedWords) {
+  try {
+    return hasModelApiKey(context.config)
+      ? await generateAiQuestions(seedWords, context)
+      : buildLocalQuestions(seedWords)
+  } catch (e) {
+    console.warn('AI 生成题目失败，使用本地题目:', e)
+    return buildLocalQuestions(seedWords)
+  }
+}
+
+function createQuizGenerationContext(seedWords) {
+  const date = dateKey()
+  const examTypeLabel = examTypes.find(type => type.key === selectedExamType.value)?.label || '综合题型'
+  const wordSignature = seedWords
+    .map(word => `${word.id ?? ''}:${String(word.word || '').toLowerCase()}`)
+    .join('|')
+  return {
+    key: [date, level.value, selectedExamType.value, seedWords.length, wordSignature].join('::'),
+    date,
+    level: level.value,
+    levelName: levelName.value,
+    examType: selectedExamType.value,
+    examTypeLabel,
+    quizSize: seedWords.length,
+    wordSignature,
+    config: cloneJson(config.value),
+  }
+}
+
+function readCachedGeneratedQuestions(context) {
+  const cached = quizQuestionCache.get(context.key)
+  if (!cached || cached.date !== context.date) return null
+  return cloneQuestions(cached.questions)
+}
+
+function pruneQuizQuestionCache(currentDate) {
+  for (const [key, item] of quizQuestionCache.entries()) {
+    if (item.date !== currentDate) {
+      quizQuestionCache.delete(key)
+    }
+  }
+  for (const key of quizQuestionRequests.keys()) {
+    if (!key.startsWith(`${currentDate}::`)) {
+      quizQuestionRequests.delete(key)
+    }
+  }
+  if (quizPageState.activeGenerationKey && !quizPageState.activeGenerationKey.startsWith(`${currentDate}::`)) {
+    quizPageState.activeGenerationKey = ''
+  }
+}
+
+function cloneQuestions(items) {
+  return (Array.isArray(items) ? items : []).map(question => ({
+    ...question,
+    options: Array.isArray(question.options) ? [...question.options] : [],
+    word: question.word ? { ...question.word } : question.word,
+  }))
+}
+
+function cloneJson(value) {
+  return value ? JSON.parse(JSON.stringify(value)) : value
 }
 
 async function loadTodayStudyWords(levelKey, allWords) {
@@ -407,11 +560,10 @@ function localDateTimeString(date = new Date()) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 
-async function generateAiQuestions(seedWords) {
-  const selectedType = examTypes.find(type => type.key === selectedExamType.value)?.label || '综合题型'
-  const searchContext = await collectSearchContext(seedWords, selectedType)
+async function generateAiQuestions(seedWords, context) {
+  const searchContext = await collectSearchContext(seedWords, context.examTypeLabel, context.config)
   const content = await invoke('call_model_api', {
-    config: config.value,
+    config: context.config,
     messages: [
       {
         role: 'system',
@@ -424,8 +576,8 @@ async function generateAiQuestions(seedWords) {
           search_instruction: searchContext.length
             ? '已提供联网搜索摘要，请优先结合搜索摘要中的真实搭配、例句、考试语境；但不要编造来源链接。'
             : '联网搜索未启用、失败或没有结果，请直接基于本地词库和参考释义生成完整题目。',
-          exam_type: selectedType,
-          source: todayWords.value.length ? 'today_study_words' : 'fallback_word_bank',
+          exam_type: context.examTypeLabel,
+          source: 'today_study_words',
           count: seedWords.length,
           search_context: searchContext,
           schema: {
@@ -456,22 +608,22 @@ async function generateAiQuestions(seedWords) {
   const parsed = extractJson(content)
   const generated = Array.isArray(parsed?.questions) ? parsed.questions : []
   const normalized = seedWords
-    .map((word, index) => normalizeGeneratedQuestion(generated[index] || {}, word))
+    .map((word, index) => normalizeGeneratedQuestion(generated[index] || {}, word, context))
     .filter(Boolean)
 
   return normalized.length ? normalized : buildLocalQuestions(seedWords)
 }
 
-async function collectSearchContext(seedWords, selectedType) {
-  if (!config.value?.search?.enabled) return []
+async function collectSearchContext(seedWords, selectedType, configValue) {
+  if (!configValue?.search?.enabled) return []
   const wordsText = seedWords.map(word => word.word).join(' ')
   try {
     const results = await invoke('web_search', {
-      config: config.value,
+      config: configValue,
       query: `${selectedType} 英语考试 词汇 搭配 例句 ${wordsText}`,
     })
     return Array.isArray(results)
-      ? results.slice(0, config.value.search.search_count || 5).map(item => ({
+      ? results.slice(0, configValue.search.search_count || 5).map(item => ({
         title: item.title,
         snippet: item.snippet,
         url: item.url,
@@ -483,7 +635,7 @@ async function collectSearchContext(seedWords, selectedType) {
   }
 }
 
-function normalizeGeneratedQuestion(item, fallbackWord) {
+function normalizeGeneratedQuestion(item, fallbackWord, context) {
   const word = fallbackWord
   const options = Array.isArray(item?.options) ? item.options.map(String).filter(Boolean) : []
   const answer = String(item?.answer || item?.correct_answer || '')
@@ -491,7 +643,7 @@ function normalizeGeneratedQuestion(item, fallbackWord) {
 
   return {
     word,
-    type: String(item?.type || examTypes.find(type => type.key === selectedExamType.value)?.label || '综合题型'),
+    type: String(item?.type || context.examTypeLabel || '综合题型'),
     stem: String(item?.stem || `写出 ${word.word} 在考试语境中的含义。`),
     options,
     correctAnswer: answer || reference,
@@ -645,6 +797,8 @@ function normalize(value) {
 }
 
 function resetQuiz() {
+  quizViewVersion++
+  quizPageState.activeGenerationKey = ''
   started.value = false
   generating.value = false
   grading.value = false

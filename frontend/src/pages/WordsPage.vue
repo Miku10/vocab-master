@@ -188,7 +188,11 @@ let hasMounted = false
 let viewVersion = 0
 let audioRequestId = 0
 let audioPlaybackId = 0
+let audioSessionId = 0
 let activeAudio = null
+const audioSourceCache = new Map()
+const audioFetchPromises = new Map()
+const audioWarmupElements = new Map()
 
 const sessionStats = reactive({
   newWords: 0,
@@ -295,6 +299,7 @@ async function loadStudyQueue(options = {}) {
   dailyPlanAlreadyComplete.value = false
   showDetail.value = false
   resetAudioState()
+  clearAudioSessionCache()
   currentIndex.value = 0
   nextPlan.value = ''
   resetStats()
@@ -317,7 +322,10 @@ async function loadStudyQueue(options = {}) {
       queueItems.value = []
       await loadCompletedSessionStats()
       if (version !== viewVersion) return
-      nextPlan.value = await readCachedNextPlan()
+      generateNextPlan({
+        allowUpdateExisting: false,
+        version,
+      }).catch(e => console.warn('恢复明日计划失败:', e))
       return
     }
 
@@ -330,6 +338,7 @@ async function loadStudyQueue(options = {}) {
     queueItems.value = queue
     if (queueItems.value.length > 0) {
       autoPlayCurrentWordAudio()
+      prefetchNextWordAudio()
     }
   } catch (e) {
     console.error('加载学习队列失败:', e)
@@ -385,6 +394,7 @@ function goNextNow() {
     resetAudioState()
     lastMemoryState.value = 'remembered'
     window.setTimeout(autoPlayCurrentWordAudio, 0)
+    prefetchNextWordAudio()
     return
   }
   completeSession()
@@ -393,6 +403,7 @@ function goNextNow() {
 async function completeSession() {
   const version = viewVersion
   const completingExtraStudy = extraStudyMode.value
+  const planContext = createPlanContext()
   sessionComplete.value = true
   dailyPlanAlreadyComplete.value = !completingExtraStudy
   showDetail.value = false
@@ -402,10 +413,10 @@ async function completeSession() {
   if (!completingExtraStudy) {
     await markDailyPlanComplete()
   }
-  if (version !== viewVersion) return
   await generateNextPlan({
     allowUpdateExisting: completingExtraStudy,
     version,
+    context: planContext,
   })
 }
 
@@ -447,42 +458,35 @@ function applySessionSummary(summary) {
   sessionStats.forgotten = Number(summary?.incorrect_count || 0)
 }
 
-async function generateNextPlan({ allowUpdateExisting = false, version = viewVersion } = {}) {
-  if (version !== viewVersion) {
-    return
-  }
-
-  const cached = await readCachedNextPlan()
+async function generateNextPlan({ allowUpdateExisting = false, version = viewVersion, context = createPlanContext() } = {}) {
+  const shouldUpdateView = () => version === viewVersion
+  const cached = await readCachedNextPlan(context)
   if (cached && !allowUpdateExisting) {
-    if (version === viewVersion) {
+    if (shouldUpdateView()) {
       nextPlan.value = cached
     }
     return
   }
 
-  if (version !== viewVersion) {
-    return
+  const forecast = await loadReviewForecast(context.level, context)
+  const reviewTarget = Math.max(
+    context.plannedReviewWords,
+    Number(forecast.due_tomorrow || 0),
+    context.stats.fuzzy,
+    context.stats.forgotten,
+  )
+  const fallback = `明天建议学习 ${context.plannedNewWords} 个新词，复习 ${reviewTarget} 个单词。\n安排理由：按 1/3/7/15/30/60 天记忆曲线，明天预计到期 ${forecast.due_tomorrow || 0} 个，其中模糊词 ${forecast.fuzzy_words || 0} 个、困难词 ${forecast.hard_words || 0} 个。`
+  await saveNextPlan(fallback, context)
+  if (shouldUpdateView()) {
+    nextPlan.value = fallback
   }
 
-  const forecast = await loadReviewForecast()
-  const reviewTarget = Math.max(
-    plannedReviewWords.value,
-    Number(forecast.due_tomorrow || 0),
-    sessionStats.fuzzy,
-    sessionStats.forgotten,
-  )
-  const fallback = `明天建议学习 ${plannedNewWords.value} 个新词，复习 ${reviewTarget} 个单词。\n安排理由：按 1/3/7/15/30/60 天记忆曲线，明天预计到期 ${forecast.due_tomorrow || 0} 个，其中模糊词 ${forecast.fuzzy_words || 0} 个、困难词 ${forecast.hard_words || 0} 个。`
-  const config = appConfig.value
+  const config = context.config
   if (!hasModelApiKey(config)) {
-    if (version === viewVersion) {
-      nextPlan.value = fallback
-      await saveNextPlan(fallback)
-    }
     return
   }
 
   try {
-    const tomorrow = dateKey(1)
     const content = await invoke('call_model_api', {
       config,
       messages: [
@@ -492,20 +496,39 @@ async function generateNextPlan({ allowUpdateExisting = false, version = viewVer
         },
         {
           role: 'user',
-          content: `今天学段：${levelName.value}。新词 ${sessionStats.newWords} 个，复习 ${sessionStats.reviewWords} 个，认识 ${sessionStats.remembered} 个，模糊 ${sessionStats.fuzzy} 个，不认识 ${sessionStats.forgotten} 个，掌握率 ${accuracyPercent.value}%。记忆曲线预测：当前到期 ${forecast.due_now || 0} 个，明天到期 ${forecast.due_tomorrow || 0} 个，模糊词 ${forecast.fuzzy_words || 0} 个，困难词 ${forecast.hard_words || 0} 个。请生成 ${tomorrow} 的学习计划，包含新词数量、复习数量、一个重点提醒，以及“为什么这样安排”的简短理由，140 字以内。`,
+          content: `今天学段：${context.levelLabel}。新词 ${context.stats.newWords} 个，复习 ${context.stats.reviewWords} 个，认识 ${context.stats.remembered} 个，模糊 ${context.stats.fuzzy} 个，不认识 ${context.stats.forgotten} 个，掌握率 ${context.accuracyPercent}%。记忆曲线预测：当前到期 ${forecast.due_now || 0} 个，明天到期 ${forecast.due_tomorrow || 0} 个，模糊词 ${forecast.fuzzy_words || 0} 个，困难词 ${forecast.hard_words || 0} 个。请生成 ${context.planDate} 的学习计划，包含新词数量、复习数量、一个重点提醒，以及“为什么这样安排”的简短理由，140 字以内。`,
         },
       ],
     })
-    if (version === viewVersion) {
+    await saveNextPlan(content, context)
+    if (shouldUpdateView()) {
       nextPlan.value = content
-      await saveNextPlan(content)
     }
   } catch (e) {
     console.warn('生成明日计划失败:', e)
-    if (version === viewVersion) {
+    if (shouldUpdateView()) {
       nextPlan.value = fallback
-      await saveNextPlan(fallback)
     }
+  }
+}
+
+function createPlanContext() {
+  return {
+    level: currentLevel.value,
+    levelLabel: levelName.value,
+    plannedNewWords: plannedNewWords.value,
+    plannedReviewWords: plannedReviewWords.value,
+    createdForDate: dateKey(0),
+    planDate: dateKey(1),
+    config: appConfig.value,
+    accuracyPercent: accuracyPercent.value,
+    stats: {
+      newWords: sessionStats.newWords,
+      reviewWords: sessionStats.reviewWords,
+      remembered: sessionStats.remembered,
+      fuzzy: sessionStats.fuzzy,
+      forgotten: sessionStats.forgotten,
+    },
   }
 }
 
@@ -518,29 +541,34 @@ function isPlaceholderApiKey(key) {
   return ['api_key', 'your_api_key', 'your-api-key', 'sk-xxx', 'sk-xxxx'].includes(key.toLowerCase())
 }
 
-async function saveNextPlan(content) {
+async function saveNextPlan(content, context = createPlanContext()) {
   await invoke('save_next_plan', { record: {
     createdAt: localDateTimeString(),
-    createdForDate: dateKey(0),
-    planDate: dateKey(1),
-    level: currentLevel.value,
+    createdForDate: context.createdForDate,
+    planDate: context.planDate,
+    level: context.level,
     content,
   } })
 }
 
-async function loadReviewForecast() {
+async function loadReviewForecast(level = currentLevel.value, context = createPlanContext()) {
   try {
-    return await invoke('get_review_forecast', { level: currentLevel.value })
+    return await invoke('get_review_forecast', { level })
   } catch (e) {
     console.warn('读取记忆曲线预测失败:', e)
-    return { due_now: 0, due_tomorrow: plannedReviewWords.value, fuzzy_words: sessionStats.fuzzy, hard_words: sessionStats.forgotten }
+    return {
+      due_now: 0,
+      due_tomorrow: context.plannedReviewWords,
+      fuzzy_words: context.stats.fuzzy,
+      hard_words: context.stats.forgotten,
+    }
   }
 }
 
-async function readCachedNextPlan() {
+async function readCachedNextPlan(context = createPlanContext()) {
   try {
     const cached = await invoke('get_next_plan')
-    if (cached?.planDate === dateKey(1) && cached?.level === currentLevel.value && cached?.content) {
+    if (cached?.planDate === context.planDate && cached?.level === context.level && cached?.content) {
       return cached.content
     }
   } catch {
@@ -614,6 +642,7 @@ function resetStudyView() {
   sessionStartedAt = 0
   resetStats()
   resetAudioState()
+  clearAudioSessionCache()
 }
 
 function clearAdvanceTimer() {
@@ -627,14 +656,16 @@ async function fetchPronunciation() {
   if (!currentWord.value.word) return
   const requestId = ++audioRequestId
   const requestedWord = currentWord.value.word
+  const requestedWordData = currentWord.value
   audioLoading.value = true
   audioError.value = ''
   audioUrl.value = ''
 
   try {
-    const url = await invoke('play_word_audio', { word: requestedWord })
+    const url = await fetchAudioSourceForWord(requestedWordData)
     if (requestId === audioRequestId && currentWord.value.word === requestedWord) {
-      audioUrl.value = normalizeAudioSource(url)
+      audioUrl.value = url
+      prefetchNextWordAudio()
     }
   } catch (e) {
     if (requestId === audioRequestId && currentWord.value.word === requestedWord) {
@@ -645,6 +676,42 @@ async function fetchPronunciation() {
       audioLoading.value = false
     }
   }
+}
+
+async function fetchAudioSourceForWord(word) {
+  const key = audioCacheKey(word)
+  if (!key) throw new Error('单词为空')
+  const cached = audioSourceCache.get(key)
+  if (cached) return cached
+
+  if (!audioFetchPromises.has(key)) {
+    const sessionId = audioSessionId
+    const request = invoke('play_word_audio', { word: word.word })
+      .then(source => {
+        if (sessionId !== audioSessionId) {
+          throw new Error('音频请求已过期')
+        }
+        const normalized = normalizeAudioSource(source)
+        audioSourceCache.set(key, normalized)
+        warmupAudioSource(key, normalized)
+        return normalized
+      })
+      .finally(() => {
+        audioFetchPromises.delete(key)
+      })
+    audioFetchPromises.set(key, request)
+  }
+
+  return audioFetchPromises.get(key)
+}
+
+function prefetchNextWordAudio() {
+  const nextItem = queueItems.value[currentIndex.value + 1]
+  const nextWord = nextItem?.word
+  if (!nextWord?.word || sessionComplete.value) return
+  fetchAudioSourceForWord(nextWord).catch(() => {
+    // 下一词预取失败不影响当前学习，进入下一张时会按正常流程再请求。
+  })
 }
 
 async function playPronunciation() {
@@ -691,6 +758,16 @@ function resetAudioState() {
   audioError.value = ''
 }
 
+function clearAudioSessionCache() {
+  audioSessionId++
+  audioSourceCache.clear()
+  audioFetchPromises.clear()
+  for (const audio of audioWarmupElements.values()) {
+    audio.src = ''
+  }
+  audioWarmupElements.clear()
+}
+
 function stopActiveAudio() {
   if (!activeAudio) return
   const audio = activeAudio
@@ -707,6 +784,24 @@ function isInterruptedAudioPlay(error) {
 
 function formatAudioError(error) {
   return String(error?.message || error || '未知错误')
+}
+
+function warmupAudioSource(key, source) {
+  if (!source || audioWarmupElements.has(key)) return
+  try {
+    const audio = new Audio(source)
+    audio.preload = 'auto'
+    audio.load()
+    audioWarmupElements.set(key, audio)
+  } catch {
+    // 浏览器不支持预热时仍可在播放时正常创建 Audio。
+  }
+}
+
+function audioCacheKey(word) {
+  const text = String(word?.word || '').trim().toLowerCase()
+  if (!text) return ''
+  return `${word?.level || currentLevel.value}:${text}`
 }
 
 function normalizeAudioSource(source) {
