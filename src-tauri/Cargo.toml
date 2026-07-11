@@ -5,7 +5,7 @@ edition = "2021"
 description = "Vocab Master - 英语词汇大师"
 
 [lib]
-name = "vocab_master"
+name = "vocab_master_lib"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
