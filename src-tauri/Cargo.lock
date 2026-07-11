@@ -4502,7 +4502,6 @@ name = "vocab-master"
 version = "1.0.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
  "chrono",
  "r2d2",
  "r2d2_sqlite",

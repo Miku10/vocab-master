@@ -20,7 +20,9 @@
     <div v-else-if="sessionComplete" class="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-100 sm:p-8">
       <div class="mb-6">
         <p class="text-sm font-medium text-emerald-600">今日学习完成</p>
-        <h3 class="mt-1 text-2xl font-bold text-slate-900">完成 {{ queueItems.length }} 张词卡</h3>
+        <h3 class="mt-1 text-2xl font-bold text-slate-900">
+          {{ dailyPlanAlreadyComplete && queueItems.length === 0 ? '今日计划已完成' : `完成 ${queueItems.length} 张词卡` }}
+        </h3>
       </div>
       <div class="mb-6 grid gap-3 sm:grid-cols-6">
         <div class="rounded-xl bg-slate-50 p-4">
@@ -174,6 +176,7 @@ const loading = ref(false)
 const showDetail = ref(false)
 const lastMemoryState = ref('remembered')
 const sessionComplete = ref(false)
+const dailyPlanAlreadyComplete = ref(false)
 const nextPlan = ref('')
 const extraStudyMode = ref(false)
 const audioUrl = ref('')
@@ -288,6 +291,7 @@ async function loadStudyQueue(options = {}) {
   extraStudyMode.value = Boolean(options.extra)
   loading.value = true
   sessionComplete.value = false
+  dailyPlanAlreadyComplete.value = false
   showDetail.value = false
   resetAudioState()
   currentIndex.value = 0
@@ -304,6 +308,15 @@ async function loadStudyQueue(options = {}) {
     plannedReviewWords.value = config.daily_review_words ?? 30
     cardAdvanceMode.value = config.card_advance_mode || 'auto'
     cardDetailSeconds.value = Math.min(10, Math.max(1, Number(config.card_detail_seconds) || 2))
+
+    if (!extraStudyMode.value && (await isDailyPlanComplete())) {
+      if (version !== viewVersion) return
+      dailyPlanAlreadyComplete.value = true
+      sessionComplete.value = true
+      queueItems.value = []
+      nextPlan.value = await readCachedNextPlan()
+      return
+    }
 
     const queue = await invoke('get_study_queue', {
       level: currentLevel.value,
@@ -376,16 +389,19 @@ function goNextNow() {
 
 async function completeSession() {
   const version = viewVersion
+  const completingExtraStudy = extraStudyMode.value
   sessionComplete.value = true
+  dailyPlanAlreadyComplete.value = !completingExtraStudy
   showDetail.value = false
   resetAudioState()
   currentIndex.value = queueItems.value.length
   await saveSessionProgress()
-  if (!extraStudyMode.value) {
+  if (!completingExtraStudy) {
     await markDailyPlanComplete()
   }
+  if (version !== viewVersion) return
   await generateNextPlan({
-    allowUpdateExisting: extraStudyMode.value,
+    allowUpdateExisting: completingExtraStudy,
     version,
   })
 }
@@ -408,6 +424,10 @@ async function saveSessionProgress() {
 }
 
 async function generateNextPlan({ allowUpdateExisting = false, version = viewVersion } = {}) {
+  if (version !== viewVersion) {
+    return
+  }
+
   const cached = await readCachedNextPlan()
   if (cached && !allowUpdateExisting) {
     if (version === viewVersion) {
@@ -516,6 +536,18 @@ async function markDailyPlanComplete() {
   }
 }
 
+async function isDailyPlanComplete() {
+  try {
+    return await invoke('is_daily_plan_complete', {
+      level: currentLevel.value,
+      date: dateKey(0),
+    })
+  } catch (e) {
+    console.warn('读取今日计划完成状态失败:', e)
+    return false
+  }
+}
+
 function startExtraStudy() {
   loadStudyQueue({ extra: true })
 }
@@ -548,6 +580,7 @@ function resetStudyView() {
   clearAdvanceTimer()
   loading.value = false
   sessionComplete.value = false
+  dailyPlanAlreadyComplete.value = false
   showDetail.value = false
   nextPlan.value = ''
   queueItems.value = []

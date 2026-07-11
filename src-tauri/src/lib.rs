@@ -1,4 +1,3 @@
-use base64::{engine::general_purpose, Engine as _};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -951,61 +950,11 @@ async fn play_word_audio(word: String) -> Result<String, String> {
 
 /// 标记单词为已掌握
 async fn cache_word_audio(word: &str) -> Result<String, String> {
-    let _ = cleanup_audio_cache(1);
     let client = reqwest::Client::new();
     append_app_log("audio", format!("lookup word={}", word));
     let audio_url = lookup_audio_url(&client, word).await?;
-
-    let resp = client
-        .get(&audio_url)
-        .header(
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        )
-        .timeout(std::time::Duration::from_secs(15))
-        .send()
-        .await
-        .map_err(|e| {
-            append_app_log(
-                "audio",
-                format!("download failed word={} url={} err={}", word, audio_url, e),
-            );
-            format!("发音下载失败：{}", e)
-        })?;
-
-    if !resp.status().is_success() {
-        append_app_log(
-            "audio",
-            format!("download http word={} status={}", word, resp.status()),
-        );
-        return Err(format!("发音下载失败：HTTP {}", resp.status()));
-    }
-
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
-        .filter(|value| value.starts_with("audio/"));
-    let bytes = resp.bytes().await.map_err(|e| {
-        append_app_log("audio", format!("read failed word={} err={}", word, e));
-        format!("发音读取失败：{}", e)
-    })?;
-    if bytes.is_empty() {
-        append_app_log("audio", format!("empty audio word={}", word));
-        return Err("发音文件为空".into());
-    }
-
-    let mime = content_type.unwrap_or_else(|| guess_audio_mime(&audio_url));
-    append_app_log(
-        "audio",
-        format!("ready word={} mime={} bytes={}", word, mime, bytes.len()),
-    );
-    Ok(format!(
-        "data:{};base64,{}",
-        mime,
-        general_purpose::STANDARD.encode(bytes.as_ref())
-    ))
+    append_app_log("audio", format!("resolved word={} url={}", word, audio_url));
+    Ok(audio_url)
 }
 
 async fn lookup_audio_url(client: &reqwest::Client, word: &str) -> Result<String, String> {
@@ -1073,65 +1022,6 @@ fn fallback_tts_url(word: &str) -> String {
         "https://dict.youdao.com/dictvoice?type=2&audio={}",
         urlencoding::encode(word)
     )
-}
-
-fn audio_cache_file_path(word: &str, audio_url: &str) -> Result<PathBuf, String> {
-    let mut path = audio_cache_dir();
-
-    let file_name = safe_audio_file_name(word);
-    let extension = audio_url
-        .split('?')
-        .next()
-        .and_then(|path| path.rsplit('.').next())
-        .filter(|ext| {
-            !ext.is_empty() && ext.len() <= 5 && ext.chars().all(|c| c.is_ascii_alphanumeric())
-        })
-        .unwrap_or("mp3");
-    path.push(format!(
-        "{}-{}.{}",
-        file_name,
-        chrono::Utc::now().timestamp_millis(),
-        extension
-    ));
-    Ok(path)
-}
-
-fn guess_audio_mime(audio_url: &str) -> String {
-    let path = audio_url.split('?').next().unwrap_or(audio_url);
-    match path
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "ogg" | "oga" => "audio/ogg".into(),
-        "wav" => "audio/wav".into(),
-        "m4a" | "mp4" => "audio/mp4".into(),
-        "webm" => "audio/webm".into(),
-        _ => "audio/mpeg".into(),
-    }
-}
-
-fn safe_audio_file_name(word: &str) -> String {
-    let sanitized: String = word
-        .trim()
-        .to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-
-    if sanitized.is_empty() {
-        "word".into()
-    } else {
-        sanitized
-    }
 }
 
 fn progress_counts(conn: &Connection, word_id: i32) -> (i32, i32) {
@@ -1280,7 +1170,7 @@ fn mark_word_hard(app: tauri::AppHandle, word: Word) -> Result<(), String> {
 #[tauri::command]
 fn save_progress(app: tauri::AppHandle, data: Value) -> Result<(), String> {
     let pool = get_db(&app)?;
-    let mut conn = pool.get().map_err(|e| e.to_string())?;
+    let conn = pool.get().map_err(|e| e.to_string())?;
     let today = local_date();
     let created_at = local_now_iso();
 
@@ -2227,13 +2117,13 @@ async fn generate_word_quiz(
     level: String,
 ) -> Result<QuizQuestion, String> {
     let prompt = format!(
-        "请为单词 '{}' 生成一道英语选择题。要求：\n\
+        "请为{}学段单词 '{}' 生成一道英语选择题。参考释义：{}\n要求：\n\
         - 题目是中文释义，选项是英文单词\n\
         - 提供4个选项（A/B/C/D），其中只有一个是正确的 '{}'\n\
         - 附带简短解释\n\
         - 严格返回 JSON 格式，不要其他内容\n\
         格式：{{\"question\":\"题目\",\"options\":[\"A选项\",\"B选项\",\"C选项\",\"D选项\"],\"answer\":正确选项索引(0-3),\"explanation\":\"解释\"}}",
-        word, word
+        level, word, definition, word
     );
 
     let messages = vec![
