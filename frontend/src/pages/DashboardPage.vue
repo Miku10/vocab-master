@@ -73,7 +73,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, nextTick, reactive } from 'vue'
+import { ref, onMounted, onBeforeUnmount, nextTick, reactive } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import * as echarts from 'echarts'
 
@@ -103,7 +103,16 @@ onMounted(async () => {
   await nextTick()
   initCharts()
   loadData()
+  window.addEventListener('app-config-updated', handleAppConfigUpdated)
 })
+
+onBeforeUnmount(() => {
+  window.removeEventListener('app-config-updated', handleAppConfigUpdated)
+})
+
+function handleAppConfigUpdated() {
+  loadData()
+}
 
 function initCharts() {
   // 1. 环形图

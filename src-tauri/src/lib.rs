@@ -114,6 +114,10 @@ pub struct ModelConfig {
     pub model_name: String,
     pub max_tokens: u32,
     pub temperature: f32,
+    #[serde(default = "default_model_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+    #[serde(default = "default_model_retry_count")]
+    pub retry_count: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -134,6 +138,8 @@ pub struct AppConfig {
     pub daily_new_words: u32,
     #[serde(default = "default_daily_review_words")]
     pub daily_review_words: u32,
+    #[serde(default = "default_study_order")]
+    pub study_order: String,
     #[serde(default = "default_card_advance_mode")]
     pub card_advance_mode: String,
     #[serde(default = "default_card_detail_seconds")]
@@ -155,6 +161,8 @@ impl Default for AppConfig {
                 model_name: "gpt-4o".into(),
                 max_tokens: 2000,
                 temperature: 0.7,
+                request_timeout_seconds: default_model_request_timeout_seconds(),
+                retry_count: default_model_retry_count(),
             },
             search: SearchConfig {
                 enabled: false,
@@ -165,6 +173,7 @@ impl Default for AppConfig {
             record_retention_days: default_record_retention_days(),
             daily_new_words: default_daily_new_words(),
             daily_review_words: default_daily_review_words(),
+            study_order: default_study_order(),
             card_advance_mode: default_card_advance_mode(),
             card_detail_seconds: default_card_detail_seconds(),
             active_level: default_active_level(),
@@ -190,12 +199,24 @@ fn default_daily_review_words() -> u32 {
     30
 }
 
+fn default_study_order() -> String {
+    "ordered".into()
+}
+
 fn default_card_advance_mode() -> String {
     "auto".into()
 }
 
 fn default_card_detail_seconds() -> u32 {
     2
+}
+
+fn default_model_request_timeout_seconds() -> u64 {
+    25
+}
+
+fn default_model_retry_count() -> u32 {
+    1
 }
 
 // ==================== 类型别名 ====================
@@ -910,13 +931,48 @@ fn get_study_queue(
                  LIMIT ?3",
             )
             .map_err(|e| e.to_string())?;
-        let review_ids: Vec<i32> = stmt
-            .query_map(params![level.as_str(), now, review_count as i64], |row| {
-                row.get(0)
-            })
+        let mut review_ids: Vec<i32> = stmt
+            .query_map(
+                params![level.as_str(), now.as_str(), review_count as i64],
+                |row| row.get(0),
+            )
             .map_err(|e| e.to_string())?
             .filter_map(|row| row.ok())
             .collect();
+
+        if review_ids.len() < review_count as usize {
+            let target = review_count as usize;
+            let mut supplemental_stmt = conn
+                .prepare(
+                    "SELECT word_id FROM word_progress
+                     WHERE level = ?1
+                       AND status != 'new'
+                     ORDER BY CASE
+                              WHEN status = 'hard' THEN 0
+                              WHEN status = 'learning' THEN 1
+                              WHEN next_review IS NULL OR next_review <= ?2 THEN 2
+                              ELSE 3
+                          END ASC,
+                          wrong_count DESC,
+                          COALESCE(next_review, '1970-01-01 00:00:00') ASC,
+                          review_count ASC,
+                          last_seen ASC",
+                )
+                .map_err(|e| e.to_string())?;
+            let supplemental_ids = supplemental_stmt
+                .query_map(params![level.as_str(), now.as_str()], |row| row.get(0))
+                .map_err(|e| e.to_string())?;
+
+            for id in supplemental_ids.filter_map(|row| row.ok()) {
+                if review_ids.contains(&id) {
+                    continue;
+                }
+                review_ids.push(id);
+                if review_ids.len() >= target {
+                    break;
+                }
+            }
+        }
 
         for id in review_ids {
             if let Some(word) = word_map.get(&id) {
@@ -1557,16 +1613,19 @@ fn clear_learning_records(app: tauri::AppHandle, scope: String) -> Result<(), St
                 .map_err(|e| e.to_string())?;
             conn.execute("DELETE FROM quiz_records", [])
                 .map_err(|e| e.to_string())?;
+            clear_study_plan_state(&conn)?;
             remove_legacy_progress_file();
         }
         "progress" => {
             conn.execute("DELETE FROM word_progress", [])
                 .map_err(|e| e.to_string())?;
+            clear_study_plan_state(&conn)?;
             remove_legacy_progress_file();
         }
         "sessions" => {
             conn.execute("DELETE FROM study_sessions", [])
                 .map_err(|e| e.to_string())?;
+            clear_study_plan_state(&conn)?;
             remove_legacy_progress_file();
         }
         "quizzes" => {
@@ -1581,6 +1640,17 @@ fn clear_learning_records(app: tauri::AppHandle, scope: String) -> Result<(), St
 
 fn remove_legacy_progress_file() {
     let _ = fs::remove_file(progress_path());
+}
+
+fn clear_study_plan_state(conn: &Connection) -> Result<(), String> {
+    conn.execute("DELETE FROM daily_plan_status", [])
+        .map_err(|e| e.to_string())?;
+    remove_next_plan_file();
+    Ok(())
+}
+
+fn remove_next_plan_file() {
+    let _ = fs::remove_file(next_plan_path());
 }
 
 #[tauri::command]
@@ -2113,14 +2183,19 @@ fn save_config(config: AppConfig) -> Result<(), String> {
 /// 调用模型 API（OpenAI 兼容格式）
 #[tauri::command]
 async fn call_model_api(config: AppConfig, messages: Vec<Value>) -> Result<String, String> {
-    let client = reqwest::Client::new();
+    let timeout_seconds = config.model.request_timeout_seconds.clamp(5, 120);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_seconds))
+        .build()
+        .map_err(|e| e.to_string())?;
     append_app_log(
         "model",
         format!(
-            "request model={} url={} messages={}",
+            "request model={} url={} messages={} timeout={}s",
             config.model.model_name,
             config.model.api_url,
-            messages.len()
+            messages.len(),
+            timeout_seconds
         ),
     );
     let body = json!({

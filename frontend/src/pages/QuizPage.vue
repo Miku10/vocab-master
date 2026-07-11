@@ -5,15 +5,20 @@
         <p class="text-sm font-medium text-blue-600">{{ levelName }} · 模拟测试</p>
         <h2 class="text-2xl font-bold text-slate-900">考试题型训练</h2>
       </div>
-      <div class="grid gap-2 sm:grid-cols-2">
+      <div class="grid gap-2 sm:grid-cols-[minmax(0,1fr)_9rem]">
         <select v-model="selectedExamType" class="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700">
           <option v-for="type in examTypes" :key="type.key" :value="type.key">{{ type.label }}</option>
         </select>
-        <select v-model.number="quizSize" class="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700">
-          <option :value="5">5 题</option>
-          <option :value="10">10 题</option>
-          <option :value="15">15 题</option>
-        </select>
+        <label class="relative block">
+          <span class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-xs font-semibold text-slate-400">题数</span>
+          <input
+            v-model.number="quizSize"
+            type="number"
+            min="1"
+            max="50"
+            class="w-full rounded-xl border border-slate-200 bg-white py-2 pl-12 pr-3 text-sm text-slate-700"
+          />
+        </label>
       </div>
     </div>
 
@@ -42,7 +47,7 @@
 
     <div v-else-if="!started" class="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-100 sm:p-8">
       <div class="mb-6">
-        <p class="text-sm font-medium text-slate-500">优先用 AI 按考试高频题型生成；未配置模型时使用本地释义默写兜底。</p>
+        <p class="text-sm font-medium text-slate-500">优先用 AI 按考试高频题型生成；当天单词少于题数时会围绕已学词生成多题。</p>
         <h3 class="mt-1 text-2xl font-bold text-slate-900">准备开始 {{ availableQuizCount }} 题测试</h3>
       </div>
       <button class="rounded-xl bg-blue-600 px-5 py-3 text-sm font-semibold text-white hover:bg-blue-700" @click="startQuiz">
@@ -80,7 +85,7 @@
       </div>
 
       <div class="space-y-3">
-        <div v-for="item in result.items" :key="item.word" class="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-100">
+        <div v-for="(item, index) in result.items" :key="`${item.word}-${index}`" class="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-100">
           <div class="mb-3 flex flex-wrap items-center justify-between gap-3">
             <div>
               <p class="text-lg font-bold text-slate-900">{{ item.word }}</p>
@@ -145,16 +150,22 @@
 <script>
 const quizQuestionCache = new Map()
 const quizQuestionRequests = new Map()
+const quizGradingCache = new Map()
+const quizGradingRequests = new Map()
 const quizPageState = {
   selectedExamType: 'mixed',
   quizSize: 10,
   activeGenerationKey: '',
+  activeGradingKey: '',
 }
 </script>
 
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+
+const MODEL_REQUEST_TIMEOUT_MS = 25000
+const MODEL_REQUEST_RETRIES = 1
 
 const levelOptions = [
   { key: 'junior', label: '初中' },
@@ -191,14 +202,19 @@ const result = ref(null)
 let quizViewVersion = 0
 
 const levelName = computed(() => levelOptions.find(item => item.key === level.value)?.label || level.value)
-const availableQuizCount = computed(() => Math.min(quizSize.value, todayWords.value.length))
+const availableQuizCount = computed(() => normalizedQuizSize())
 
-onMounted(loadWords)
+onMounted(() => {
+  loadWords()
+  window.addEventListener('app-config-updated', handleAppConfigUpdated)
+})
 onBeforeUnmount(() => {
   quizViewVersion++
+  window.removeEventListener('app-config-updated', handleAppConfigUpdated)
 })
 
 watch([selectedExamType, quizSize], () => {
+  quizSize.value = normalizedQuizSize()
   quizPageState.selectedExamType = selectedExamType.value
   quizPageState.quizSize = quizSize.value
   if (started.value || generating.value || result.value) {
@@ -219,6 +235,7 @@ async function loadWords() {
     loading.value = false
   }
   restoreActiveQuizGeneration().catch(e => console.warn('恢复题目生成状态失败:', e))
+  restoreActiveQuizGrading().catch(e => console.warn('恢复批阅状态失败:', e))
 }
 
 async function refreshQuizSource() {
@@ -229,6 +246,20 @@ async function refreshQuizSource() {
   words.value = [...data].sort((a, b) => (a.frequency || 999999) - (b.frequency || 999999))
   dailyPlanComplete.value = await isDailyPlanComplete(level.value)
   todayWords.value = await loadTodayStudyWords(level.value, words.value)
+}
+
+function handleAppConfigUpdated(event) {
+  const nextConfig = event.detail
+  if (!nextConfig) return
+  const nextLevel = nextConfig.active_level || 'junior'
+  const levelChanged = nextLevel !== level.value
+  config.value = cloneJson(nextConfig)
+  if (levelChanged && !grading.value) {
+    resetQuiz()
+    loadWords()
+    return
+  }
+  level.value = nextLevel
 }
 
 async function startQuiz() {
@@ -266,64 +297,24 @@ async function startQuiz() {
 }
 
 async function submitQuiz() {
+  const context = createGradingContext()
+  const version = ++quizViewVersion
+  quizPageState.activeGradingKey = context.key
   grading.value = true
-  const fallback = buildLocalResult()
   try {
-    if (!hasModelApiKey()) {
-      result.value = fallback
-      await saveQuizRecord(fallback)
-      return
-    }
-
-    const content = await invoke('call_model_api', {
-      config: config.value,
-      messages: [
-        {
-          role: 'system',
-          content: '你是严谨的英语词汇测试阅卷老师。只返回 JSON，不要返回 Markdown。',
-        },
-        {
-          role: 'user',
-          content: JSON.stringify({
-            instruction: '请根据参考释义批阅用户答案，给出总分、逐题解析、分数和学习建议。总分 0-100。',
-            schema: {
-              score: 88,
-              summary: '整体表现总结',
-              advice: ['建议1', '建议2'],
-              items: [
-                {
-                  word: 'example',
-                  answer: '用户答案',
-                  is_correct: true,
-                  score: 10,
-                  analysis: '解析',
-                  suggestion: '建议',
-                },
-              ],
-            },
-            questions: questions.value.map((question, index) => ({
-              word: question.word.word,
-              type: question.type,
-              stem: question.stem,
-              options: question.options,
-              correct_answer: question.correctAnswer,
-              reference: question.reference,
-              answer: answers.value[index] || '',
-            })),
-          }),
-        },
-      ],
-    })
-
-    const parsed = extractJson(content)
-    result.value = normalizeAiResult(parsed, fallback)
-    await saveQuizRecord(result.value)
+    const finalResult = await getGradingResult(context)
+    if (version !== quizViewVersion) return
+    result.value = finalResult
   } catch (e) {
     console.warn('AI 批阅失败，使用本地评分:', e)
+    const fallback = buildLocalResultFromContext(context)
+    await saveQuizRecordFromContext(context, fallback)
+    if (version !== quizViewVersion) return
     result.value = fallback
-    await saveQuizRecord(fallback)
   } finally {
-    grading.value = false
+    if (version === quizViewVersion) {
+      grading.value = false
+    }
   }
 }
 
@@ -354,9 +345,240 @@ function buildLocalResult() {
   }
 }
 
+async function restoreActiveQuizGrading() {
+  const key = quizPageState.activeGradingKey
+  if (!key || result.value) return
+  const cached = quizGradingCache.get(key)
+  if (cached) {
+    started.value = true
+    grading.value = false
+    result.value = cloneJson(cached)
+    return
+  }
+
+  const request = quizGradingRequests.get(key)
+  if (!request) return
+  const version = ++quizViewVersion
+  started.value = true
+  grading.value = true
+  try {
+    const finalResult = await request
+    if (version !== quizViewVersion) return
+    result.value = cloneJson(finalResult)
+  } finally {
+    if (version === quizViewVersion) {
+      grading.value = false
+    }
+  }
+}
+
+async function getGradingResult(context) {
+  const cached = quizGradingCache.get(context.key)
+  if (cached) return cloneJson(cached)
+
+  if (!quizGradingRequests.has(context.key)) {
+    const request = buildGradingResult(context)
+      .then(finalResult => {
+        quizGradingCache.set(context.key, cloneJson(finalResult))
+        return finalResult
+      })
+      .finally(() => {
+        quizGradingRequests.delete(context.key)
+      })
+    quizGradingRequests.set(context.key, request)
+  }
+
+  const finalResult = await quizGradingRequests.get(context.key)
+  return cloneJson(finalResult)
+}
+
+async function buildGradingResult(context) {
+  const fallback = buildLocalResultFromContext(context)
+  try {
+    if (!hasModelApiKey(context.config)) {
+      await saveQuizRecordFromContext(context, fallback)
+      return fallback
+    }
+
+    const content = await callModelApiWithRetry({
+      config: context.config,
+      messages: [
+        {
+          role: 'system',
+          content: '你是严谨的英语词汇测试阅卷老师。只返回 JSON，不要返回 Markdown。',
+        },
+        {
+          role: 'user',
+          content: JSON.stringify({
+            instruction: '请根据参考释义批阅用户答案，给出总分、逐题解析、分数和学习建议。总分 0-100。',
+            schema: {
+              score: 88,
+              summary: '整体表现总结',
+              advice: ['建议1', '建议2'],
+              items: [
+                {
+                  word: 'example',
+                  answer: '用户答案',
+                  is_correct: true,
+                  score: 10,
+                  analysis: '解析',
+                  suggestion: '建议',
+                },
+              ],
+            },
+            questions: context.questions.map((question, index) => ({
+              word: question.word.word,
+              type: question.type,
+              stem: question.stem,
+              options: question.options,
+              correct_answer: question.correctAnswer,
+              reference: question.reference,
+              answer: context.answers[index] || '',
+            })),
+          }),
+        },
+      ],
+    })
+
+    const parsed = extractJson(content)
+    const finalResult = normalizeAiResultFromContext(parsed, fallback, context)
+    await saveQuizRecordFromContext(context, finalResult)
+    return finalResult
+  } catch (e) {
+    console.warn('AI 批阅失败，使用本地评分:', e)
+    await saveQuizRecordFromContext(context, fallback)
+    return fallback
+  }
+}
+
+function createGradingContext() {
+  const contextQuestions = cloneQuestions(questions.value)
+  const contextAnswers = [...answers.value]
+  const answerSignature = contextAnswers.map(answer => String(answer || '').trim()).join('|')
+  const questionSignature = contextQuestions.map(question => `${question.word?.id ?? ''}:${question.word?.word ?? ''}:${question.correctAnswer ?? ''}`).join('|')
+  const key = [dateKey(), level.value, selectedExamType.value, contextQuestions.length, questionSignature, answerSignature].join('::')
+  return {
+    key,
+    date: dateKey(),
+    level: level.value,
+    levelName: levelName.value,
+    examType: selectedExamType.value,
+    examTypeName: examTypes.find(type => type.key === selectedExamType.value)?.label || selectedExamType.value,
+    config: cloneJson(config.value),
+    questions: contextQuestions,
+    answers: contextAnswers,
+  }
+}
+
+function buildLocalResultFromContext(context) {
+  const items = context.questions.map((question, index) => {
+    const answer = context.answers[index] || ''
+    const isCorrect = answerMatches(answer, question.correctAnswer || question.reference)
+    return {
+      word: question.word.word,
+      answer,
+      is_correct: isCorrect,
+      score: questionScoreFrom(isCorrect, context.questions.length),
+      analysis: isCorrect
+        ? `答案命中了参考答案：${question.correctAnswer || question.reference}`
+        : `参考答案：${question.correctAnswer || question.reference}。${question.explanation || ''}`,
+      suggestion: isCorrect ? '保持复习节奏。' : '把这个词加入明日重点复习。',
+    }
+  })
+  const correctCount = items.filter(item => item.is_correct).length
+  const score = context.questions.length ? Math.round((correctCount / context.questions.length) * 100) : 0
+
+  return {
+    score,
+    summary: hasModelApiKey(context.config)
+      ? `本地兜底评分：答对 ${correctCount} / ${context.questions.length}。`
+      : `未配置模型，已使用本地关键词匹配评分：答对 ${correctCount} / ${context.questions.length}。`,
+    advice: score >= 80 ? ['继续增加新词量', '保持每日复习'] : ['降低新词量', '优先复习错词'],
+    items,
+  }
+}
+
+function normalizeAiResultFromContext(parsed, fallback, context) {
+  if (!parsed || typeof parsed !== 'object') return fallback
+  const aiItems = Array.isArray(parsed.items) ? parsed.items : []
+  const items = context.questions.map((question, index) => {
+    const aiItem = aiItems[index] || {}
+    const answer = context.answers[index] || ''
+    const isCorrect = answerMatches(answer, question.correctAnswer || question.reference)
+    return {
+      word: String(aiItem.word || question.word.word || ''),
+      answer,
+      is_correct: isCorrect,
+      score: questionScoreFrom(isCorrect, context.questions.length),
+      analysis: String(aiItem.analysis || fallback.items[index]?.analysis || ''),
+      suggestion: String(aiItem.suggestion || fallback.items[index]?.suggestion || ''),
+    }
+  })
+  const correctCount = items.filter(item => item.is_correct).length
+  const score = context.questions.length ? Math.round((correctCount / context.questions.length) * 100) : 0
+  const advice = Array.isArray(parsed.advice)
+    ? parsed.advice.map(String)
+    : parsed.advice
+      ? [String(parsed.advice)]
+      : fallback.advice
+
+  return {
+    score,
+    summary: `按参考答案自动核算：答对 ${correctCount} / ${context.questions.length}。AI 解析仅用于说明和建议。`,
+    advice,
+    items,
+  }
+}
+
+function questionScoreFrom(isCorrect, questionCount) {
+  if (!isCorrect || !questionCount) return 0
+  return Math.round(100 / questionCount)
+}
+
 function hasModelApiKey(configValue = config.value) {
   const key = String(configValue?.model?.api_key || '').trim()
   return Boolean(key && !isPlaceholderApiKey(key))
+}
+
+async function callModelApiWithRetry(payload, options = {}) {
+  const timeoutMs = options.timeoutMs ?? modelRequestTimeoutMs(payload?.config)
+  const retries = options.retries ?? modelRetryCount(payload?.config)
+  let lastError = null
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await withTimeout(invoke('call_model_api', payload), timeoutMs, '模型请求超时')
+    } catch (e) {
+      lastError = e
+      if (attempt < retries) {
+        await delay(600)
+      }
+    }
+  }
+  throw lastError
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  let timer = null
+  const timeout = new Promise((_, reject) => {
+    timer = window.setTimeout(() => reject(new Error(message)), timeoutMs)
+  })
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) window.clearTimeout(timer)
+  })
+}
+
+function delay(ms) {
+  return new Promise(resolve => window.setTimeout(resolve, ms))
+}
+
+function modelRequestTimeoutMs(configValue) {
+  const seconds = Number(configValue?.model?.request_timeout_seconds ?? MODEL_REQUEST_TIMEOUT_MS / 1000)
+  return Math.min(120, Math.max(5, seconds || 25)) * 1000
+}
+
+function modelRetryCount(configValue) {
+  const retries = Number(configValue?.model?.retry_count ?? MODEL_REQUEST_RETRIES)
+  return Math.min(5, Math.max(0, Number.isFinite(retries) ? Math.floor(retries) : MODEL_REQUEST_RETRIES))
 }
 
 function isPlaceholderApiKey(key) {
@@ -364,7 +586,15 @@ function isPlaceholderApiKey(key) {
 }
 
 function selectQuizSeedWords() {
-  return todayWords.value.slice(0, Math.min(quizSize.value, todayWords.value.length))
+  const source = todayWords.value
+  if (!source.length) return []
+  const count = normalizedQuizSize()
+  return Array.from({ length: count }, (_, index) => source[index % source.length])
+}
+
+function normalizedQuizSize() {
+  const count = Number(quizSize.value)
+  return Math.min(50, Math.max(1, Number.isFinite(count) ? Math.floor(count) : 10))
 }
 
 async function restoreActiveQuizGeneration() {
@@ -562,7 +792,7 @@ function localDateTimeString(date = new Date()) {
 
 async function generateAiQuestions(seedWords, context) {
   const searchContext = await collectSearchContext(seedWords, context.examTypeLabel, context.config)
-  const content = await invoke('call_model_api', {
+  const content = await callModelApiWithRetry({
     config: context.config,
     messages: [
       {
@@ -710,10 +940,14 @@ function questionScore(isCorrect) {
 }
 
 async function saveQuizRecord(finalResult) {
+  await saveQuizRecordFromContext(createGradingContext(), finalResult)
+}
+
+async function saveQuizRecordFromContext(context, finalResult) {
   try {
     await invoke('save_quiz_record', {
-      record: buildQuizRecord(finalResult),
-      retentionDays: config.value?.record_retention_days ?? 7,
+      record: buildQuizRecordFromContext(context, finalResult),
+      retentionDays: context.config?.record_retention_days ?? 7,
     })
   } catch (e) {
     console.warn('淇濆瓨娴嬭瘯璁板綍澶辫触:', e)
@@ -721,14 +955,18 @@ async function saveQuizRecord(finalResult) {
 }
 
 function buildQuizRecord(finalResult) {
+  return buildQuizRecordFromContext(createGradingContext(), finalResult)
+}
+
+function buildQuizRecordFromContext(context, finalResult) {
   return {
-    level: level.value,
-    level_name: levelName.value,
-    exam_type: selectedExamType.value,
-    exam_type_name: examTypes.find(type => type.key === selectedExamType.value)?.label || selectedExamType.value,
-    quiz_size: questions.value.length,
+    level: context.level,
+    level_name: context.levelName,
+    exam_type: context.examType,
+    exam_type_name: context.examTypeName,
+    quiz_size: context.questions.length,
     created_at: localDateTimeString(),
-    questions: questions.value.map((question, index) => ({
+    questions: context.questions.map((question, index) => ({
       index: index + 1,
       word: question.word.word,
       type: question.type,
@@ -737,7 +975,7 @@ function buildQuizRecord(finalResult) {
       correct_answer: question.correctAnswer,
       reference: question.reference,
       explanation: question.explanation,
-      answer: answers.value[index] || '',
+      answer: context.answers[index] || '',
       result: finalResult.items?.[index] || null,
     })),
     result: finalResult,
@@ -799,6 +1037,7 @@ function normalize(value) {
 function resetQuiz() {
   quizViewVersion++
   quizPageState.activeGenerationKey = ''
+  quizPageState.activeGradingKey = ''
   started.value = false
   generating.value = false
   grading.value = false

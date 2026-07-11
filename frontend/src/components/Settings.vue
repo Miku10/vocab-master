@@ -35,7 +35,7 @@
         <section v-if="activeTab === 'study'" class="space-y-5">
           <div class="panel">
             <h3 class="section-title">学习计划</h3>
-            <div class="grid gap-4 sm:grid-cols-3">
+            <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
               <label class="block">
                 <span class="label">当前学段</span>
                 <select v-model="config.active_level" class="field">
@@ -49,6 +49,13 @@
               <label class="block">
                 <span class="label">每日复习</span>
                 <input v-model.number="config.daily_review_words" type="number" min="0" max="300" class="field" />
+              </label>
+              <label class="block">
+                <span class="label">学习顺序</span>
+                <select v-model="config.study_order" class="field">
+                  <option value="ordered">顺序学习</option>
+                  <option value="random">乱序学习</option>
+                </select>
               </label>
             </div>
           </div>
@@ -239,7 +246,7 @@
                 <span class="label">API 密钥</span>
                 <input v-model="config.model.api_key" type="password" class="field" autocomplete="new-password" spellcheck="false" placeholder="保存后用于 AI 生成，不设置默认值" />
               </label>
-              <div class="grid gap-4 sm:grid-cols-3">
+              <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
                 <label class="block">
                   <span class="label">模型名称</span>
                   <input v-model="config.model.model_name" class="field" />
@@ -251,6 +258,14 @@
                 <label class="block">
                   <span class="label">温度</span>
                   <input v-model.number="config.model.temperature" type="number" step="0.1" min="0" max="2" class="field" />
+                </label>
+                <label class="block">
+                  <span class="label">超时秒数</span>
+                  <input v-model.number="config.model.request_timeout_seconds" type="number" min="5" max="120" class="field" />
+                </label>
+                <label class="block">
+                  <span class="label">重试次数</span>
+                  <input v-model.number="config.model.retry_count" type="number" min="0" max="5" class="field" />
                 </label>
               </div>
             </div>
@@ -377,6 +392,8 @@ const config = reactive({
     model_name: 'gpt-4o',
     max_tokens: 2000,
     temperature: 0.7,
+    request_timeout_seconds: 25,
+    retry_count: 1,
   },
   search: {
     enabled: false,
@@ -387,6 +404,7 @@ const config = reactive({
   record_retention_days: 7,
   daily_new_words: 20,
   daily_review_words: 30,
+  study_order: 'ordered',
   card_advance_mode: 'auto',
   card_detail_seconds: 2,
   active_level: 'junior',
@@ -420,6 +438,7 @@ invoke('get_config').then(data => {
   config.record_retention_days = data.record_retention_days ?? config.record_retention_days
   config.daily_new_words = data.daily_new_words ?? config.daily_new_words
   config.daily_review_words = data.daily_review_words ?? config.daily_review_words
+  config.study_order = data.study_order || config.study_order
   config.card_advance_mode = data.card_advance_mode || config.card_advance_mode
   config.card_detail_seconds = data.card_detail_seconds ?? config.card_detail_seconds
   config.active_level = data.active_level || config.active_level
@@ -571,10 +590,10 @@ async function deleteRecord(recordType, id) {
 
 async function clearRecords(scope) {
   const labels = {
-    progress: '词卡学习进度',
-    sessions: '学习会话',
+    progress: '词卡学习进度和学习计划',
+    sessions: '学习会话和学习计划',
     quizzes: '测验记录',
-    all: '全部学习记录',
+    all: '全部学习记录和学习计划',
   }
   if (!confirm(`确认清空${labels[scope] || '记录'}？此操作不可恢复。`)) return
   try {
@@ -624,17 +643,25 @@ function savePrompt() {
 async function saveAll() {
   try {
     config.model.api_key = sanitizeApiKey(config.model.api_key)
+    config.model.request_timeout_seconds = Math.min(120, Math.max(5, Number(config.model.request_timeout_seconds) || 25))
+    config.model.retry_count = Math.min(5, Math.max(0, Number(config.model.retry_count) || 0))
     config.daily_new_words = Math.max(1, Number(config.daily_new_words) || 20)
     config.daily_review_words = Math.max(0, Number(config.daily_review_words) || 0)
+    config.study_order = config.study_order === 'random' ? 'random' : 'ordered'
     config.card_detail_seconds = Math.min(10, Math.max(1, Number(config.card_detail_seconds) || 2))
     config.audio_expire_hours = Math.max(1, Number(config.audio_expire_hours) || 5)
     config.record_retention_days = Math.min(365, Math.max(1, Number(config.record_retention_days) || 7))
     config.setup_complete = true
     await invoke('save_config', { config })
+    window.dispatchEvent(new CustomEvent('app-config-updated', { detail: cloneConfig(config) }))
     emit('close')
   } catch (e) {
     alert('保存失败: ' + e)
   }
+}
+
+function cloneConfig(value) {
+  return JSON.parse(JSON.stringify(value))
 }
 
 function sanitizeApiKey(value) {

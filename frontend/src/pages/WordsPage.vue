@@ -156,6 +156,9 @@ import { computed, onActivated, onBeforeUnmount, onMounted, reactive, ref } from
 import { onBeforeRouteLeave } from 'vue-router'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 
+const MODEL_REQUEST_TIMEOUT_MS = 25000
+const MODEL_REQUEST_RETRIES = 1
+
 const levelOptions = [
   { key: 'junior', label: '初中' },
   { key: 'high', label: '高中' },
@@ -168,6 +171,7 @@ const appConfig = ref(null)
 const currentLevel = ref('junior')
 const plannedNewWords = ref(20)
 const plannedReviewWords = ref(30)
+const studyOrder = ref('ordered')
 const cardAdvanceMode = ref('auto')
 const cardDetailSeconds = ref(2)
 const queueItems = ref([])
@@ -272,6 +276,7 @@ const parsedDefinitions = computed(() => {
 
 onMounted(() => {
   hasMounted = true
+  window.addEventListener('app-config-updated', handleAppConfigUpdated)
   loadStudyQueue()
 })
 
@@ -288,6 +293,7 @@ onBeforeRouteLeave(() => {
 onBeforeUnmount(() => {
   viewVersion++
   clearAdvanceTimer()
+  window.removeEventListener('app-config-updated', handleAppConfigUpdated)
 })
 
 async function loadStudyQueue(options = {}) {
@@ -308,12 +314,7 @@ async function loadStudyQueue(options = {}) {
   try {
     const config = await invoke('get_config')
     if (version !== viewVersion) return
-    appConfig.value = config
-    currentLevel.value = config.active_level || 'junior'
-    plannedNewWords.value = config.daily_new_words ?? 20
-    plannedReviewWords.value = config.daily_review_words ?? 30
-    cardAdvanceMode.value = config.card_advance_mode || 'auto'
-    cardDetailSeconds.value = Math.min(10, Math.max(1, Number(config.card_detail_seconds) || 2))
+    applyStudyConfig(config)
 
     if (!extraStudyMode.value && (await isDailyPlanComplete())) {
       if (version !== viewVersion) return
@@ -335,7 +336,7 @@ async function loadStudyQueue(options = {}) {
       reviewCount: plannedReviewWords.value,
     })
     if (version !== viewVersion) return
-    queueItems.value = queue
+    queueItems.value = applyStudyOrder(queue)
     if (queueItems.value.length > 0) {
       autoPlayCurrentWordAudio()
       prefetchNextWordAudio()
@@ -349,6 +350,31 @@ async function loadStudyQueue(options = {}) {
     if (version === viewVersion) {
       loading.value = false
     }
+  }
+}
+
+function applyStudyConfig(config) {
+  appConfig.value = config
+  currentLevel.value = config.active_level || 'junior'
+  plannedNewWords.value = config.daily_new_words ?? 20
+  plannedReviewWords.value = config.daily_review_words ?? 30
+  studyOrder.value = config.study_order || 'ordered'
+  cardAdvanceMode.value = config.card_advance_mode || 'auto'
+  cardDetailSeconds.value = Math.min(10, Math.max(1, Number(config.card_detail_seconds) || 2))
+}
+
+function handleAppConfigUpdated(event) {
+  const nextConfig = event.detail
+  if (!nextConfig) return
+  const queueConfigChanged =
+    (nextConfig.active_level || 'junior') !== currentLevel.value
+    || Number(nextConfig.daily_new_words ?? 20) !== plannedNewWords.value
+    || Number(nextConfig.daily_review_words ?? 30) !== plannedReviewWords.value
+    || (nextConfig.study_order || 'ordered') !== studyOrder.value
+
+  applyStudyConfig(nextConfig)
+  if (queueConfigChanged && !loading.value) {
+    loadStudyQueue({ extra: extraStudyMode.value })
   }
 }
 
@@ -487,7 +513,7 @@ async function generateNextPlan({ allowUpdateExisting = false, version = viewVer
   }
 
   try {
-    const content = await invoke('call_model_api', {
+    const content = await callModelApiWithRetry({
       config,
       messages: [
         {
@@ -535,6 +561,47 @@ function createPlanContext() {
 function hasModelApiKey(config) {
   const key = String(config?.model?.api_key || '').trim()
   return Boolean(key && !isPlaceholderApiKey(key))
+}
+
+async function callModelApiWithRetry(payload, options = {}) {
+  const timeoutMs = options.timeoutMs ?? modelRequestTimeoutMs(payload?.config)
+  const retries = options.retries ?? modelRetryCount(payload?.config)
+  let lastError = null
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await withTimeout(invoke('call_model_api', payload), timeoutMs, '模型请求超时')
+    } catch (e) {
+      lastError = e
+      if (attempt < retries) {
+        await delay(600)
+      }
+    }
+  }
+  throw lastError
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  let timer = null
+  const timeout = new Promise((_, reject) => {
+    timer = window.setTimeout(() => reject(new Error(message)), timeoutMs)
+  })
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) window.clearTimeout(timer)
+  })
+}
+
+function delay(ms) {
+  return new Promise(resolve => window.setTimeout(resolve, ms))
+}
+
+function modelRequestTimeoutMs(config) {
+  const seconds = Number(config?.model?.request_timeout_seconds ?? MODEL_REQUEST_TIMEOUT_MS / 1000)
+  return Math.min(120, Math.max(5, seconds || 25)) * 1000
+}
+
+function modelRetryCount(config) {
+  const retries = Number(config?.model?.retry_count ?? MODEL_REQUEST_RETRIES)
+  return Math.min(5, Math.max(0, Number.isFinite(retries) ? Math.floor(retries) : MODEL_REQUEST_RETRIES))
 }
 
 function isPlaceholderApiKey(key) {
@@ -602,6 +669,18 @@ async function isDailyPlanComplete() {
 
 function startExtraStudy() {
   loadStudyQueue({ extra: true })
+}
+
+function applyStudyOrder(queue) {
+  const items = Array.isArray(queue) ? [...queue] : []
+  if (studyOrder.value !== 'random') return items
+  for (let index = items.length - 1; index > 0; index--) {
+    const target = Math.floor(Math.random() * (index + 1))
+    const current = items[index]
+    items[index] = items[target]
+    items[target] = current
+  }
+  return items
 }
 
 function sessionDurationSeconds() {
